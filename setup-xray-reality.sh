@@ -57,15 +57,17 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/XTLS/Xray-install/main/i
 mkdir -p "$XRAY_CONFIG_DIR"
 
 echo "=== [4/9] Generating credentials (UUID, REALITY keypair, short ID) ==="
-UUID=$(xray uuid)
-KEY_OUTPUT=$(xray x25519)
+UUID=$(xray uuid) || { echo "ERROR: 'xray uuid' command failed to run." >&2; exit 1; }
+KEY_OUTPUT=$(xray x25519) || { echo "ERROR: 'xray x25519' command failed to run." >&2; exit 1; }
 
 # Xray changed the `x25519` CLI output format in newer builds:
 #   Old: "Private key: xxx" / "Public key: xxx"
 #   New: "PrivateKey: xxx"  / "Password: xxx" (Password IS the public key) / "Hash32: xxx"
-# Handle both so this script keeps working across Xray versions.
-PRIVATE_KEY=$(echo "$KEY_OUTPUT" | grep -Ei '^(Private ?[Kk]ey):' | awk -F': ' '{print $2}' | tr -d ' \r')
-PUBLIC_KEY=$(echo "$KEY_OUTPUT" | grep -Ei '^(Public ?[Kk]ey|Password):' | awk -F': ' '{print $2}' | tr -d ' \r')
+# Handle both, tolerate leading whitespace, and never let a non-matching
+# grep (which exits 1) abort the script under `set -e`/`pipefail` --
+# we check for empty results explicitly below instead.
+PRIVATE_KEY=$(echo "$KEY_OUTPUT" | grep -Ei '^[[:space:]]*(Private ?[Kk]ey)[[:space:]]*:' | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d ' \r' || true)
+PUBLIC_KEY=$(echo "$KEY_OUTPUT" | grep -Ei '^[[:space:]]*(Public ?[Kk]ey|Password)[[:space:]]*:' | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d ' \r' || true)
 SHORT_ID=$(openssl rand -hex 8)
 
 if [[ -z "$UUID" || -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" || -z "$SHORT_ID" ]]; then
