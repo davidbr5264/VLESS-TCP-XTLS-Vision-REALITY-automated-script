@@ -59,12 +59,23 @@ mkdir -p "$XRAY_CONFIG_DIR"
 echo "=== [4/9] Generating credentials (UUID, REALITY keypair, short ID) ==="
 UUID=$(xray uuid)
 KEY_OUTPUT=$(xray x25519)
-PRIVATE_KEY=$(echo "$KEY_OUTPUT" | awk '/Private key:/ {print $3}')
-PUBLIC_KEY=$(echo "$KEY_OUTPUT" | awk '/Public key:/ {print $3}')
+
+# Xray changed the `x25519` CLI output format in newer builds:
+#   Old: "Private key: xxx" / "Public key: xxx"
+#   New: "PrivateKey: xxx"  / "Password: xxx" (Password IS the public key) / "Hash32: xxx"
+# Handle both so this script keeps working across Xray versions.
+PRIVATE_KEY=$(echo "$KEY_OUTPUT" | grep -Ei '^(Private ?[Kk]ey):' | awk -F': ' '{print $2}' | tr -d ' \r')
+PUBLIC_KEY=$(echo "$KEY_OUTPUT" | grep -Ei '^(Public ?[Kk]ey|Password):' | awk -F': ' '{print $2}' | tr -d ' \r')
 SHORT_ID=$(openssl rand -hex 8)
 
 if [[ -z "$UUID" || -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" || -z "$SHORT_ID" ]]; then
   echo "ERROR: Failed to generate one or more credentials." >&2
+  echo "  UUID=${UUID:-<empty>}" >&2
+  echo "  PRIVATE_KEY=${PRIVATE_KEY:-<empty>}" >&2
+  echo "  PUBLIC_KEY=${PUBLIC_KEY:-<empty>}" >&2
+  echo "  SHORT_ID=${SHORT_ID:-<empty>}" >&2
+  echo "  Raw 'xray x25519' output was:" >&2
+  echo "$KEY_OUTPUT" >&2
   exit 1
 fi
 
