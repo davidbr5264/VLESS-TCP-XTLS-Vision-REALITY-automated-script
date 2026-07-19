@@ -216,6 +216,15 @@ write_config() {
 EOF
   mkdir -p /var/log/xray
   chown -R nobody:nogroup /var/log/xray 2>/dev/null || true
+
+  # Fail fast with a clear message if the config we just wrote is malformed,
+  # rather than letting it surface later as an opaque "service failed to
+  # start" from systemd.
+  if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+    echo "ERROR: Generated config.json is not valid JSON. Not restarting xray." >&2
+    echo "  Check ${CONFIG_FILE} manually, or restore from ${BACKUP_ROOT}/." >&2
+    exit 1
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -253,7 +262,18 @@ restart_and_verify() {
 # ---------------------------------------------------------------------------
 output_client_info() {
   local server_ip
-  server_ip=$(curl -fsSL -4 https://ifconfig.me || curl -fsSL -4 https://api.ipify.org)
+  server_ip=$(curl -fsSL -4 --max-time 5 https://ifconfig.me 2>/dev/null || \
+              curl -fsSL -4 --max-time 5 https://api.ipify.org 2>/dev/null || \
+              curl -fsSL -4 --max-time 5 https://icanhazip.com 2>/dev/null || \
+              true)
+  server_ip=$(echo "$server_ip" | tr -d '[:space:]')
+
+  if [[ -z "$server_ip" ]]; then
+    echo "WARNING: Could not determine the server's public IP (all lookup services unreachable)." >&2
+    echo "         Everything else succeeded -- find your IP manually (e.g. 'curl ifconfig.me' or" >&2
+    echo "         your VPS provider's dashboard) and substitute it into the link below." >&2
+    server_ip="YOUR_SERVER_IP"
+  fi
 
   local vless_link="vless://${UUID}@${server_ip}:${LISTEN_PORT}?type=tcp&security=reality&pbk=${PUBLIC_KEY}&fp=chrome&sni=${SNI_DOMAIN}&sid=${SHORT_ID}&flow=xtls-rprx-vision&spx=%2F#xray-reality-$(hostname)"
 
@@ -356,8 +376,8 @@ apt-get install -y \
 # Not required by anything below, so a missing package here (package
 # names/availability vary across Debian/Ubuntu versions and minimal
 # cloud images) should warn, not abort the whole install.
-apt-get install -y gnupg lsb-release apt-transport-https || \
-  echo "NOTE: one or more optional packages (gnupg/lsb-release/apt-transport-https) were unavailable; continuing anyway, they aren't required."
+apt-get install -y gnupg lsb-release apt-transport-https logrotate || \
+  echo "NOTE: one or more optional packages (gnupg/lsb-release/apt-transport-https/logrotate) were unavailable; continuing anyway, they aren't required."
 
 if [[ -f /var/run/reboot-required ]]; then
   echo "NOTE: A previous update marked this system as needing a reboot."
@@ -366,7 +386,18 @@ if [[ -f /var/run/reboot-required ]]; then
 fi
 
 echo "=== [2/9] Installing Xray-core (official installer) ==="
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)" @ install
+XRAY_INSTALL_ATTEMPTS=3
+for attempt in $(seq 1 "$XRAY_INSTALL_ATTEMPTS"); do
+  if bash -c "$(curl -fsSL https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)" @ install; then
+    break
+  fi
+  if [[ "$attempt" -eq "$XRAY_INSTALL_ATTEMPTS" ]]; then
+    echo "ERROR: Failed to install Xray-core after ${XRAY_INSTALL_ATTEMPTS} attempts (likely a network issue reaching GitHub)." >&2
+    exit 1
+  fi
+  echo "Xray-core install attempt ${attempt} failed, retrying in 5s..."
+  sleep 5
+done
 
 mkdir -p "$XRAY_CONFIG_DIR"
 
@@ -401,8 +432,25 @@ restart_and_verify
 echo "=== [6/9] Configuring firewall (UFW) ==="
 SSH_PORT=$(ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed 's/.*://' | head -n1)
 SSH_PORT="${SSH_PORT:-22}"
-ufw allow "${SSH_PORT}"/tcp comment 'SSH' || true
-ufw allow "${LISTEN_PORT}"/tcp comment 'Xray REALITY' || true
+
+# Pin the default policy explicitly rather than relying on whatever the
+# base image shipped with.
+ufw default deny incoming
+ufw default allow outgoing
+
+# These two rules are load-bearing (lose either one and you either can't
+# SSH in or the proxy stops working), so a failure here should stop the
+# script rather than be silently swallowed.
+if ! ufw allow "${SSH_PORT}"/tcp comment 'SSH'; then
+  echo "ERROR: Failed to add UFW rule for SSH port ${SSH_PORT}. Not enabling the firewall." >&2
+  echo "       Fix manually, then re-run: ufw allow ${SSH_PORT}/tcp && ufw --force enable" >&2
+  exit 1
+fi
+if ! ufw allow "${LISTEN_PORT}"/tcp comment 'Xray REALITY'; then
+  echo "ERROR: Failed to add UFW rule for Xray port ${LISTEN_PORT}. Not enabling the firewall." >&2
+  exit 1
+fi
+
 ufw --force enable
 ufw reload
 
@@ -435,6 +483,19 @@ net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.all.accept_source_route = 0
 EOF
 sysctl --system >/dev/null
+
+# Prevent /var/log/xray/error.log from growing unbounded on a long-lived box.
+cat > /etc/logrotate.d/xray <<'EOF'
+/var/log/xray/error.log {
+  weekly
+  rotate 4
+  compress
+  delaycompress
+  missingok
+  notifempty
+  copytruncate
+}
+EOF
 
 echo "=== [9/9] Setting up daily reboot at midnight ==="
 cat > /etc/systemd/system/daily-reboot.service <<'EOF'
