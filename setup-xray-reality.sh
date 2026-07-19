@@ -26,6 +26,7 @@
 #   6. Configures UFW (only SSH + Xray port open) and fail2ban for sshd
 #   7. Enables BBR + fq congestion control, applies basic sysctl hardening
 #   8. Prints a ready-to-import vless:// link + QR code
+#   9. Schedules a daily reboot at midnight (server local time)
 #
 # Re-running (install or any --rotate mode) automatically backs up the
 # previous config + client info under /root/xray-backups/<timestamp>/
@@ -339,27 +340,27 @@ fi
 # ---------------------------------------------------------------------------
 backup_current_state
 
-echo "=== [1/9] Updating system packages ==="
+echo "=== [1/10] Updating system packages ==="
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get upgrade -y
 
-echo "=== [2/9] Installing dependencies ==="
+echo "=== [2/10] Installing dependencies ==="
 apt-get install -y curl wget unzip jq openssl qrencode ufw fail2ban ca-certificates
 
-echo "=== [3/9] Installing Xray-core (official installer) ==="
+echo "=== [3/10] Installing Xray-core (official installer) ==="
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)" @ install
 
 mkdir -p "$XRAY_CONFIG_DIR"
 
-echo "=== [4/9] Generating credentials (UUID, REALITY keypair, short ID) ==="
+echo "=== [4/10] Generating credentials (UUID, REALITY keypair, short ID) ==="
 generate_uuid_and_shortid
 generate_reality_keypair
 
-echo "=== [5/9] Writing Xray config (privacy-minded: no access logging) ==="
+echo "=== [5/10] Writing Xray config (privacy-minded: no access logging) ==="
 write_config
 
-echo "=== [6/9] Hardening the systemd service ==="
+echo "=== [6/10] Hardening the systemd service ==="
 mkdir -p /etc/systemd/system/${SERVICE_NAME}.service.d
 cat > /etc/systemd/system/${SERVICE_NAME}.service.d/override.conf <<'EOF'
 [Service]
@@ -380,7 +381,7 @@ EOF
 
 restart_and_verify
 
-echo "=== [7/9] Configuring firewall (UFW) ==="
+echo "=== [7/10] Configuring firewall (UFW) ==="
 SSH_PORT=$(ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed 's/.*://' | head -n1)
 SSH_PORT="${SSH_PORT:-22}"
 ufw allow "${SSH_PORT}"/tcp comment 'SSH' || true
@@ -388,7 +389,7 @@ ufw allow "${LISTEN_PORT}"/tcp comment 'Xray REALITY' || true
 ufw --force enable
 ufw reload
 
-echo "=== [8/9] Configuring fail2ban for SSH brute-force protection ==="
+echo "=== [8/10] Configuring fail2ban for SSH brute-force protection ==="
 cat > /etc/fail2ban/jail.d/sshd.local <<EOF
 [sshd]
 enabled = true
@@ -400,7 +401,7 @@ EOF
 systemctl enable fail2ban
 systemctl restart fail2ban
 
-echo "=== [9/9] Enabling BBR + basic kernel/network hardening ==="
+echo "=== [9/10] Enabling BBR + basic kernel/network hardening ==="
 cat > /etc/sysctl.d/99-xray-hardening.conf <<'EOF'
 # Congestion control
 net.core.default_qdisc = fq
@@ -418,11 +419,40 @@ net.ipv6.conf.all.accept_source_route = 0
 EOF
 sysctl --system >/dev/null
 
+echo "=== [10/10] Setting up daily reboot at midnight ==="
+cat > /etc/systemd/system/daily-reboot.service <<'EOF'
+[Unit]
+Description=Daily scheduled reboot
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/shutdown -r now "Scheduled daily reboot"
+EOF
+
+cat > /etc/systemd/system/daily-reboot.timer <<'EOF'
+[Unit]
+Description=Daily reboot at midnight
+
+[Timer]
+OnCalendar=*-*-* 00:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now daily-reboot.timer
+
 save_state
 output_client_info
 
 echo ""
-echo "Setup complete. Re-run this script any time:"
+echo "Setup complete. Server will reboot daily at 00:00 (server local time)."
+echo "Check timezone with: timedatectl   (change with: timedatectl set-timezone <Region/City>)"
+echo "Cancel the daily reboot with: systemctl disable --now daily-reboot.timer"
+echo ""
+echo "Re-run this script any time:"
 echo "  ./setup-xray-reality.sh              -> re-apply full setup (backs up old config first)"
 echo "  ./setup-xray-reality.sh --rotate-uuid -> revoke current client link, keep server identity"
 echo "  ./setup-xray-reality.sh --rotate-all  -> full credential reset (invalidates everything)"
