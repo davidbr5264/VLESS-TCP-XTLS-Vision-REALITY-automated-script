@@ -18,15 +18,16 @@
 #   ./setup-xray-reality.sh --help         Show this help
 #
 # What a full install does:
-#   1. Installs latest official Xray-core (XTLS/Xray-install)
-#   2. Generates UUID, REALITY x25519 keypair, and a short ID
-#   3. Writes a minimal-logging config.json (VLESS + TCP + XTLS-Vision + REALITY)
-#   4. Camouflages as a real site (default: i.ytimg.com)
+#   1. Prepares the server: full apt update/upgrade, cleanup, essential tools
+#   2. Installs latest official Xray-core (XTLS/Xray-install)
+#   3. Generates UUID, REALITY x25519 keypair, and a short ID
+#   4. Writes a minimal-logging config.json (VLESS + TCP + XTLS-Vision + REALITY)
+#      camouflaged as a real site (default: i.ytimg.com)
 #   5. Locks the systemd unit down (NoNewPrivileges, ProtectSystem, etc.)
 #   6. Configures UFW (only SSH + Xray port open) and fail2ban for sshd
 #   7. Enables BBR + fq congestion control, applies basic sysctl hardening
-#   8. Prints a ready-to-import vless:// link + QR code
-#   9. Schedules a daily reboot at midnight (server local time)
+#   8. Schedules a daily reboot at midnight (server local time)
+#   9. Prints a ready-to-import vless:// link + QR code
 #
 # Re-running (install or any --rotate mode) automatically backs up the
 # previous config + client info under /root/xray-backups/<timestamp>/
@@ -340,27 +341,40 @@ fi
 # ---------------------------------------------------------------------------
 backup_current_state
 
-echo "=== [1/10] Updating system packages ==="
+echo "=== [1/9] Preparing server (updates, cleanup, essential tools) ==="
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get upgrade -y
+apt-get autoremove -y --purge
+apt-get autoclean -y
 
-echo "=== [2/10] Installing dependencies ==="
-apt-get install -y curl wget unzip jq openssl qrencode ufw fail2ban ca-certificates
+# Base tools needed by this script and its dependencies (curl for the Xray
+# installer, jq/openssl for parsing and crypto, ufw/fail2ban for the
+# firewall/brute-force steps below, plus a few prerequisites that later
+# apt-key/repo operations commonly assume are already present).
+apt-get install -y \
+  curl wget unzip jq openssl qrencode ufw fail2ban ca-certificates \
+  gnupg lsb-release apt-transport-https software-properties-common
 
-echo "=== [3/10] Installing Xray-core (official installer) ==="
+if [[ -f /var/run/reboot-required ]]; then
+  echo "NOTE: A previous update marked this system as needing a reboot."
+  echo "      The daily reboot timer set up later in this script will handle it,"
+  echo "      or reboot manually now with: reboot"
+fi
+
+echo "=== [2/9] Installing Xray-core (official installer) ==="
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)" @ install
 
 mkdir -p "$XRAY_CONFIG_DIR"
 
-echo "=== [4/10] Generating credentials (UUID, REALITY keypair, short ID) ==="
+echo "=== [3/9] Generating credentials (UUID, REALITY keypair, short ID) ==="
 generate_uuid_and_shortid
 generate_reality_keypair
 
-echo "=== [5/10] Writing Xray config (privacy-minded: no access logging) ==="
+echo "=== [4/9] Writing Xray config (privacy-minded: no access logging) ==="
 write_config
 
-echo "=== [6/10] Hardening the systemd service ==="
+echo "=== [5/9] Hardening the systemd service ==="
 mkdir -p /etc/systemd/system/${SERVICE_NAME}.service.d
 cat > /etc/systemd/system/${SERVICE_NAME}.service.d/override.conf <<'EOF'
 [Service]
@@ -381,7 +395,7 @@ EOF
 
 restart_and_verify
 
-echo "=== [7/10] Configuring firewall (UFW) ==="
+echo "=== [6/9] Configuring firewall (UFW) ==="
 SSH_PORT=$(ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed 's/.*://' | head -n1)
 SSH_PORT="${SSH_PORT:-22}"
 ufw allow "${SSH_PORT}"/tcp comment 'SSH' || true
@@ -389,7 +403,7 @@ ufw allow "${LISTEN_PORT}"/tcp comment 'Xray REALITY' || true
 ufw --force enable
 ufw reload
 
-echo "=== [8/10] Configuring fail2ban for SSH brute-force protection ==="
+echo "=== [7/9] Configuring fail2ban for SSH brute-force protection ==="
 cat > /etc/fail2ban/jail.d/sshd.local <<EOF
 [sshd]
 enabled = true
@@ -401,7 +415,7 @@ EOF
 systemctl enable fail2ban
 systemctl restart fail2ban
 
-echo "=== [9/10] Enabling BBR + basic kernel/network hardening ==="
+echo "=== [8/9] Enabling BBR + basic kernel/network hardening ==="
 cat > /etc/sysctl.d/99-xray-hardening.conf <<'EOF'
 # Congestion control
 net.core.default_qdisc = fq
@@ -419,7 +433,7 @@ net.ipv6.conf.all.accept_source_route = 0
 EOF
 sysctl --system >/dev/null
 
-echo "=== [10/10] Setting up daily reboot at midnight ==="
+echo "=== [9/9] Setting up daily reboot at midnight ==="
 cat > /etc/systemd/system/daily-reboot.service <<'EOF'
 [Unit]
 Description=Daily scheduled reboot
