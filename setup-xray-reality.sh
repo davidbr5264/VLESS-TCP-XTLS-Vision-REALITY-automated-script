@@ -67,7 +67,7 @@ KEY_OUTPUT=$(xray x25519) || { echo "ERROR: 'xray x25519' command failed to run.
 # grep (which exits 1) abort the script under `set -e`/`pipefail` --
 # we check for empty results explicitly below instead.
 PRIVATE_KEY=$(echo "$KEY_OUTPUT" | grep -Ei '^[[:space:]]*(Private ?[Kk]ey)[[:space:]]*:' | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d ' \r' || true)
-PUBLIC_KEY=$(echo "$KEY_OUTPUT" | grep -Ei '^[[:space:]]*(Public ?[Kk]ey|Password)[[:space:]]*:' | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d ' \r' || true)
+PUBLIC_KEY=$(echo "$KEY_OUTPUT" | grep -Ei '^[[:space:]]*(Public ?[Kk]ey|Password)([[:space:]]*\(.*\))?[[:space:]]*:' | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d ' \r' || true)
 SHORT_ID=$(openssl rand -hex 8)
 
 if [[ -z "$UUID" || -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" || -z "$SHORT_ID" ]]; then
