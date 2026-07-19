@@ -348,13 +348,16 @@ apt-get upgrade -y
 apt-get autoremove -y --purge
 apt-get autoclean -y
 
-# Base tools needed by this script and its dependencies (curl for the Xray
-# installer, jq/openssl for parsing and crypto, ufw/fail2ban for the
-# firewall/brute-force steps below, plus a few prerequisites that later
-# apt-key/repo operations commonly assume are already present).
+# Packages this script actually depends on -- install must succeed.
 apt-get install -y \
-  curl wget unzip jq openssl qrencode ufw fail2ban ca-certificates \
-  gnupg lsb-release apt-transport-https software-properties-common
+  curl wget unzip jq openssl qrencode ufw fail2ban ca-certificates
+
+# "Nice to have" base tools some environments are missing by default.
+# Not required by anything below, so a missing package here (package
+# names/availability vary across Debian/Ubuntu versions and minimal
+# cloud images) should warn, not abort the whole install.
+apt-get install -y gnupg lsb-release apt-transport-https || \
+  echo "NOTE: one or more optional packages (gnupg/lsb-release/apt-transport-https) were unavailable; continuing anyway, they aren't required."
 
 if [[ -f /var/run/reboot-required ]]; then
   echo "NOTE: A previous update marked this system as needing a reboot."
