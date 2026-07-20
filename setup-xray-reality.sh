@@ -410,9 +410,15 @@ done
 
 mkdir -p "$XRAY_CONFIG_DIR"
 
-echo "=== [3/9] Generating credentials (UUID, REALITY keypair, short ID) ==="
-generate_uuid_and_shortid
-generate_reality_keypair
+echo "=== [3/9] Setting up credentials (UUID, REALITY keypair, short ID) ==="
+if [[ -n "$UUID" && -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" && -n "$SHORT_ID" ]]; then
+  echo "Existing credentials found in ${STATE_FILE} -- reusing them (client links stay valid)."
+  echo "Need fresh credentials instead? Use --rotate-uuid or --rotate-all, not a plain re-run."
+else
+  echo "No existing credentials found -- generating new ones (first-time install)."
+  generate_uuid_and_shortid
+  generate_reality_keypair
+fi
 
 echo "=== [4/9] Writing Xray config (privacy-minded: no access logging) ==="
 write_config
