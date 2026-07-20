@@ -169,6 +169,12 @@ write_config() {
     "access": "none",
     "error": "/var/log/xray/error.log"
   },
+  "dns": {
+    "servers": [
+      "https://1.1.1.1/dns-query",
+      "https://9.9.9.9/dns-query"
+    ]
+  },
   "inbounds": [
     {
       "listen": "0.0.0.0",
@@ -205,7 +211,10 @@ write_config() {
   "outbounds": [
     {
       "protocol": "freedom",
-      "tag": "direct"
+      "tag": "direct",
+      "settings": {
+        "domainStrategy": "UseIP"
+      }
     },
     {
       "protocol": "blackhole",
@@ -432,6 +441,14 @@ restart_and_verify
 echo "=== [6/9] Configuring firewall (UFW) ==="
 SSH_PORT=$(ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed 's/.*://' | head -n1)
 SSH_PORT="${SSH_PORT:-22}"
+
+# Make sure UFW actually enforces IPv6 too -- if IPV6=no here, the rules
+# below only apply to IPv4 and a public IPv6 address (common on many VPS
+# providers by default) would be left completely unfiltered.
+if [[ -f /etc/default/ufw ]] && grep -qE '^IPV6=no' /etc/default/ufw; then
+  sed -i 's/^IPV6=no/IPV6=yes/' /etc/default/ufw
+  echo "Enabled IPv6 support in UFW (was disabled; would have left IPv6 unfiltered)."
+fi
 
 # Pin the default policy explicitly rather than relying on whatever the
 # base image shipped with.
