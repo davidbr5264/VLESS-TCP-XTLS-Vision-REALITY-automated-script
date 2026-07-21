@@ -629,14 +629,10 @@ else
 fi
 
 # Everything above (config, firewall, fail2ban, sysctl, reboot timer) is
-# now in place. Print the client link/QR first, then restart xray last --
-# so the restart is the very final action of the whole run.
+# now in place. Print the client link/QR and all summary info first, and
+# restart xray as the literal last action of the whole script.
 save_state
 output_client_info
-
-echo ""
-echo "=== Restarting Xray with final configuration ==="
-restart_and_verify
 
 echo ""
 echo "Setup complete. Server will reboot daily at 00:00 (server local time)."
@@ -648,3 +644,7 @@ echo "  reality                 -> re-apply full setup (backs up old config firs
 echo "  reality --rotate-uuid   -> revoke current client link, keep server identity"
 echo "  reality --rotate-all    -> full credential reset (invalidates everything)"
 echo "  reality --show          -> reprint current client link + QR"
+
+echo ""
+echo "=== Restarting Xray with final configuration ==="
+restart_and_verify
