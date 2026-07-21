@@ -566,18 +566,32 @@ systemctl enable --now daily-reboot.timer
 # If $0 isn't a real file (e.g. run via `bash <(curl -Ls ...)`, where $0
 # points to a process-substitution pipe, not a regular file), fall back
 # to re-downloading the script fresh from SCRIPT_SOURCE_URL instead.
+# Install a short-name copy so this script can be run as 'reality' from
+# anywhere, instead of needing to remember/find the original file path.
+# Copies the content (not a symlink), so it keeps working even if the
+# original downloaded copy is moved or deleted.
+#
+# If $0 isn't a real file (e.g. run via `bash <(curl -Ls ...)`, where $0
+# points to a process-substitution pipe, not a regular file), fall back
+# to re-downloading the script fresh from SCRIPT_SOURCE_URL instead.
+REALITY_SHORTCUT="/usr/local/bin/reality"
 SELF_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
-if [[ -f "$SELF_PATH" ]]; then
-  cp -f "$SELF_PATH" /usr/local/bin/reality
-  chmod +x /usr/local/bin/reality
-elif curl -fsSL "$SCRIPT_SOURCE_URL" -o /usr/local/bin/reality 2>/dev/null; then
-  chmod +x /usr/local/bin/reality
+REALITY_SHORTCUT_RESOLVED=$(readlink -f "$REALITY_SHORTCUT" 2>/dev/null || echo "$REALITY_SHORTCUT")
+
+if [[ "$SELF_PATH" == "$REALITY_SHORTCUT_RESOLVED" ]]; then
+  # Already running as the installed shortcut -- nothing to copy onto itself.
+  chmod +x "$REALITY_SHORTCUT" 2>/dev/null || true
+elif [[ -f "$SELF_PATH" ]]; then
+  cp -f "$SELF_PATH" "$REALITY_SHORTCUT"
+  chmod +x "$REALITY_SHORTCUT"
+elif curl -fsSL "$SCRIPT_SOURCE_URL" -o "$REALITY_SHORTCUT" 2>/dev/null; then
+  chmod +x "$REALITY_SHORTCUT"
 else
   echo "WARNING: Could not install the 'reality' shortcut (this run wasn't from a" >&2
   echo "         real file on disk, e.g. 'bash <(curl ...)', and re-downloading" >&2
   echo "         from ${SCRIPT_SOURCE_URL} also failed)." >&2
   echo "         Everything else succeeded -- to add the shortcut manually:" >&2
-  echo "           curl -fsSL ${SCRIPT_SOURCE_URL} -o /usr/local/bin/reality && chmod +x /usr/local/bin/reality" >&2
+  echo "           curl -fsSL ${SCRIPT_SOURCE_URL} -o ${REALITY_SHORTCUT} && chmod +x ${REALITY_SHORTCUT}" >&2
 fi
 
 # Everything above (config, firewall, fail2ban, sysctl, reboot timer) is
