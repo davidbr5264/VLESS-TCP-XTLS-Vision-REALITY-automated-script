@@ -427,6 +427,10 @@ echo "=== [5/9] Hardening the systemd service ==="
 mkdir -p /etc/systemd/system/${SERVICE_NAME}.service.d
 cat > /etc/systemd/system/${SERVICE_NAME}.service.d/override.conf <<'EOF'
 [Service]
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -469,7 +473,7 @@ if ! ufw allow "${SSH_PORT}"/tcp comment 'SSH'; then
   echo "       Fix manually, then re-run: ufw allow ${SSH_PORT}/tcp && ufw --force enable" >&2
   exit 1
 fi
-if ! ufw allow "${LISTEN_PORT}"/tcp comment 'Xray REALITY'; then
+if ! ufw limit "${LISTEN_PORT}"/tcp comment 'Xray REALITY (rate-limited)'; then
   echo "ERROR: Failed to add UFW rule for Xray port ${LISTEN_PORT}. Not enabling the firewall." >&2
   exit 1
 fi
