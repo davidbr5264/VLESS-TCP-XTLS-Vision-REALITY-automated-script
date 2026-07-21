@@ -341,8 +341,8 @@ if [[ "$MODE" == "rotate-uuid" ]]; then
   generate_uuid_and_shortid
   write_config
   save_state
-  restart_and_verify
   output_client_info
+  restart_and_verify
   echo ""
   echo "Old client link is now invalid. Any device using it must import the new link above."
   exit 0
@@ -358,8 +358,8 @@ if [[ "$MODE" == "rotate-all" ]]; then
   generate_reality_keypair
   write_config
   save_state
-  restart_and_verify
   output_client_info
+  restart_and_verify
   echo ""
   echo "All previous client links are now permanently invalid."
   exit 0
@@ -564,15 +564,14 @@ if [[ -f "$SELF_PATH" ]]; then
 fi
 
 # Everything above (config, firewall, fail2ban, sysctl, reboot timer) is
-# now in place. Restart xray exactly once here, at the very end, instead
-# of mid-script -- so the service only bounces once, after every other
-# step has already succeeded, rather than picking up new config partway
-# through the run while later steps are still being applied.
-echo "=== Restarting Xray with final configuration ==="
-restart_and_verify
-
+# now in place. Print the client link/QR first, then restart xray last --
+# so the restart is the very final action of the whole run.
 save_state
 output_client_info
+
+echo ""
+echo "=== Restarting Xray with final configuration ==="
+restart_and_verify
 
 echo ""
 echo "Setup complete. Server will reboot daily at 00:00 (server local time)."
