@@ -40,6 +40,11 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 SNI_DOMAIN_DEFAULT="${SNI_DOMAIN:-i.ytimg.com}"   # REALITY camouflage target
 LISTEN_PORT_DEFAULT="${LISTEN_PORT:-443}"         # Xray listen port
+# Used as a fallback to install the 'reality' shortcut when this script is
+# run via a process substitution / pipe (e.g. `bash <(curl -Ls ...)`),
+# where $0 doesn't point to an actual file on disk. Override via env var
+# if you're running a fork of this script from a different location.
+SCRIPT_SOURCE_URL="${SCRIPT_SOURCE_URL:-https://raw.githubusercontent.com/davidbr5264/VLESS-TCP-XTLS-Vision-REALITY-automated-script/master/setup-xray-reality.sh}"
 XRAY_CONFIG_DIR="/usr/local/etc/xray"
 CONFIG_FILE="${XRAY_CONFIG_DIR}/config.json"
 STATE_FILE="${XRAY_CONFIG_DIR}/.reality-state"    # remembers settings between runs
@@ -557,10 +562,22 @@ systemctl enable --now daily-reboot.timer
 # anywhere, instead of needing to remember/find the original file path.
 # Copies the content (not a symlink), so it keeps working even if the
 # original downloaded copy is moved or deleted.
+#
+# If $0 isn't a real file (e.g. run via `bash <(curl -Ls ...)`, where $0
+# points to a process-substitution pipe, not a regular file), fall back
+# to re-downloading the script fresh from SCRIPT_SOURCE_URL instead.
 SELF_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
 if [[ -f "$SELF_PATH" ]]; then
   cp -f "$SELF_PATH" /usr/local/bin/reality
   chmod +x /usr/local/bin/reality
+elif curl -fsSL "$SCRIPT_SOURCE_URL" -o /usr/local/bin/reality 2>/dev/null; then
+  chmod +x /usr/local/bin/reality
+else
+  echo "WARNING: Could not install the 'reality' shortcut (this run wasn't from a" >&2
+  echo "         real file on disk, e.g. 'bash <(curl ...)', and re-downloading" >&2
+  echo "         from ${SCRIPT_SOURCE_URL} also failed)." >&2
+  echo "         Everything else succeeded -- to add the shortcut manually:" >&2
+  echo "           curl -fsSL ${SCRIPT_SOURCE_URL} -o /usr/local/bin/reality && chmod +x /usr/local/bin/reality" >&2
 fi
 
 # Everything above (config, firewall, fail2ban, sysctl, reboot timer) is
