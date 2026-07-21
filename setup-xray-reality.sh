@@ -473,7 +473,7 @@ if ! ufw allow "${SSH_PORT}"/tcp comment 'SSH'; then
   echo "       Fix manually, then re-run: ufw allow ${SSH_PORT}/tcp && ufw --force enable" >&2
   exit 1
 fi
-if ! ufw limit "${LISTEN_PORT}"/tcp comment 'Xray REALITY (rate-limited)'; then
+if ! ufw allow "${LISTEN_PORT}"/tcp comment 'Xray REALITY'; then
   echo "ERROR: Failed to add UFW rule for Xray port ${LISTEN_PORT}. Not enabling the firewall." >&2
   exit 1
 fi
