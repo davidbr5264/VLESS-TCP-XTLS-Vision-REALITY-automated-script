@@ -549,6 +549,16 @@ EOF
 systemctl daemon-reload
 systemctl enable --now daily-reboot.timer
 
+# Install a short-name copy so this script can be run as 'reality' from
+# anywhere, instead of needing to remember/find the original file path.
+# Copies the content (not a symlink), so it keeps working even if the
+# original downloaded copy is moved or deleted.
+SELF_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
+if [[ -f "$SELF_PATH" ]]; then
+  cp -f "$SELF_PATH" /usr/local/bin/reality
+  chmod +x /usr/local/bin/reality
+fi
+
 save_state
 output_client_info
 
@@ -557,8 +567,8 @@ echo "Setup complete. Server will reboot daily at 00:00 (server local time)."
 echo "Check timezone with: timedatectl   (change with: timedatectl set-timezone <Region/City>)"
 echo "Cancel the daily reboot with: systemctl disable --now daily-reboot.timer"
 echo ""
-echo "Re-run this script any time:"
-echo "  ./setup-xray-reality.sh              -> re-apply full setup (backs up old config first)"
-echo "  ./setup-xray-reality.sh --rotate-uuid -> revoke current client link, keep server identity"
-echo "  ./setup-xray-reality.sh --rotate-all  -> full credential reset (invalidates everything)"
-echo "  ./setup-xray-reality.sh --show        -> reprint current client link + QR"
+echo "Re-run any time (works via either name, from any directory):"
+echo "  reality                 -> re-apply full setup (backs up old config first)"
+echo "  reality --rotate-uuid   -> revoke current client link, keep server identity"
+echo "  reality --rotate-all    -> full credential reset (invalidates everything)"
+echo "  reality --show          -> reprint current client link + QR"
