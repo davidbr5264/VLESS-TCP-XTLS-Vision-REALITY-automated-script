@@ -446,7 +446,11 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 EOF
 
-restart_and_verify
+# Reload the unit + drop-in now so the change is registered, but hold off
+# on actually restarting until every other step below has succeeded --
+# see the single restart_and_verify call at the very end of install mode.
+systemctl daemon-reload
+systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
 
 echo "=== [6/9] Configuring firewall (UFW) ==="
 SSH_PORT=$(ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed 's/.*://' | head -n1)
@@ -558,6 +562,14 @@ if [[ -f "$SELF_PATH" ]]; then
   cp -f "$SELF_PATH" /usr/local/bin/reality
   chmod +x /usr/local/bin/reality
 fi
+
+# Everything above (config, firewall, fail2ban, sysctl, reboot timer) is
+# now in place. Restart xray exactly once here, at the very end, instead
+# of mid-script -- so the service only bounces once, after every other
+# step has already succeeded, rather than picking up new config partway
+# through the run while later steps are still being applied.
+echo "=== Restarting Xray with final configuration ==="
+restart_and_verify
 
 save_state
 output_client_info
