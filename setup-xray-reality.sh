@@ -229,7 +229,12 @@ write_config() {
 }
 EOF
   mkdir -p /var/log/xray
-  chown -R nobody:nogroup /var/log/xray 2>/dev/null || true
+  chown -R xray:xray /var/log/xray 2>/dev/null || true
+
+  # Config contains the REALITY private key -- restrict to root + the xray
+  # service user rather than leaving it world-readable.
+  chown root:xray "$CONFIG_FILE" 2>/dev/null || true
+  chmod 640 "$CONFIG_FILE" 2>/dev/null || true
 
   # Fail fast with a clear message if the config we just wrote is malformed,
   # rather than letting it surface later as an opaque "service failed to
@@ -425,6 +430,13 @@ else
   generate_reality_keypair
 fi
 
+# Dedicated unprivileged system account for the xray service to run as
+# (see step 5 below). Created here, before write_config, so the config
+# file's ownership can be set correctly on first install.
+if ! id -u xray >/dev/null 2>&1; then
+  useradd --system --no-create-home --shell /usr/sbin/nologin xray
+fi
+
 echo "=== [4/9] Writing Xray config (privacy-minded: no access logging) ==="
 write_config
 
@@ -432,10 +444,13 @@ echo "=== [5/9] Hardening the systemd service ==="
 mkdir -p /etc/systemd/system/${SERVICE_NAME}.service.d
 cat > /etc/systemd/system/${SERVICE_NAME}.service.d/override.conf <<'EOF'
 [Service]
+User=xray
+Group=xray
 Restart=on-failure
 RestartSec=5
 StartLimitIntervalSec=60
 StartLimitBurst=5
+LimitCORE=0
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -508,17 +523,36 @@ cat > /etc/sysctl.d/99-xray-hardening.conf <<'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 
-# Basic network hardening
+# Basic network hardening (.all applies to existing interfaces, .default
+# applies to interfaces that come up after this is set)
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.tcp_syncookies = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.default.accept_source_route = 0
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.all.accept_source_route = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv6.conf.default.accept_source_route = 0
+
+# Restrict ptrace to direct child processes only -- blunts a class of
+# local privilege escalation via one process attaching a debugger to another
+kernel.yama.ptrace_scope = 1
 EOF
 sysctl --system >/dev/null
+
+# Cap the systemd journal's disk usage explicitly rather than trusting
+# whatever default the base image shipped with.
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/99-xray-hardening.conf <<'EOF'
+[Journal]
+SystemMaxUse=200M
+EOF
+systemctl restart systemd-journald
 
 # Prevent /var/log/xray/error.log from growing unbounded on a long-lived box.
 cat > /etc/logrotate.d/xray <<'EOF'
