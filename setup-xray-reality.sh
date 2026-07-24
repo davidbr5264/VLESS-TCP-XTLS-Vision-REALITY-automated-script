@@ -15,6 +15,9 @@
 #                                           keypair (invalidates ALL client links)
 #   ./setup-xray-reality.sh --show         Reprint the current client link/QR
 #                                           without changing anything
+#   ./setup-xray-reality.sh --list-backups List available backups with timestamps
+#   ./setup-xray-reality.sh --restore TS   Restore config/state from a backup
+#                                           (backs up current state first)
 #   ./setup-xray-reality.sh --help         Show this help
 #
 # What a full install does:
@@ -53,12 +56,22 @@ BACKUP_ROOT="/root/xray-backups"
 SERVICE_NAME="xray"
 
 MODE="install"
+RESTORE_TS=""
 case "${1:-}" in
-  --rotate-uuid) MODE="rotate-uuid" ;;
-  --rotate-all)  MODE="rotate-all" ;;
-  --show)        MODE="show" ;;
+  --rotate-uuid)   MODE="rotate-uuid" ;;
+  --rotate-all)    MODE="rotate-all" ;;
+  --show)          MODE="show" ;;
+  --list-backups)  MODE="list-backups" ;;
+  --restore)
+    MODE="restore"
+    RESTORE_TS="${2:-}"
+    if [[ -z "$RESTORE_TS" ]]; then
+      echo "ERROR: --restore requires a timestamp. See --list-backups for available ones." >&2
+      exit 1
+    fi
+    ;;
   --help|-h)
-    sed -n '2,25p' "$0"
+    sed -n '2,38p' "$0"
     exit 0
     ;;
   "") ;;
@@ -84,6 +97,19 @@ fi
 if [[ "$MODE" == "install" ]] && ! command -v apt-get >/dev/null 2>&1; then
   echo "ERROR: This script only supports Debian/Ubuntu (apt-based) systems." >&2
   exit 1
+fi
+
+# Fail with a clear message rather than a confusing mid-script error if
+# there's not enough room for apt upgrades, Xray-core, and logs/backups.
+if [[ "$MODE" == "install" ]]; then
+  AVAILABLE_KB=$(df --output=avail / 2>/dev/null | tail -n1 | tr -d ' ')
+  MIN_REQUIRED_KB=1048576  # 1GB
+  if [[ -n "$AVAILABLE_KB" ]] && [[ "$AVAILABLE_KB" -lt "$MIN_REQUIRED_KB" ]]; then
+    echo "ERROR: Less than 1GB free on / (found $((AVAILABLE_KB / 1024))MB)." >&2
+    echo "       apt upgrades, Xray-core, and logs need headroom to install safely." >&2
+    echo "       Free up space first (e.g. 'apt autoremove --purge -y'), then re-run." >&2
+    exit 1
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -124,6 +150,16 @@ backup_current_state() {
     [[ -f "$STATE_FILE" ]] && cp -a "$STATE_FILE" "$backup_dir/state" 2>/dev/null || true
     chmod -R 600 "$backup_dir"/* 2>/dev/null || true
     echo "Backed up previous config to: $backup_dir"
+
+    # Keep only the most recent 15 backups so this directory doesn't grow
+    # forever across years of periodic rotates/reinstalls.
+    if [[ -d "$BACKUP_ROOT" ]]; then
+      local backup_count
+      backup_count=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d | wc -l)
+      if [[ "$backup_count" -gt 15 ]]; then
+        find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d | sort | head -n "$((backup_count - 15))" | xargs -r rm -rf
+      fi
+    fi
   fi
 }
 
@@ -167,7 +203,9 @@ generate_reality_keypair() {
 # ---------------------------------------------------------------------------
 write_config() {
   mkdir -p "$XRAY_CONFIG_DIR"
-  cat > "$CONFIG_FILE" <<EOF
+  local tmp_config
+  tmp_config=$(mktemp "${XRAY_CONFIG_DIR}/.config.json.XXXXXX")
+  cat > "$tmp_config" <<EOF
 {
   "log": {
     "loglevel": "warning",
@@ -209,7 +247,7 @@ write_config() {
       },
       "sniffing": {
         "enabled": true,
-        "destOverride": ["http", "tls"]
+        "destOverride": ["tls"]
       }
     }
   ],
@@ -225,9 +263,41 @@ write_config() {
       "protocol": "blackhole",
       "tag": "block"
     }
-  ]
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "ip": [
+          "169.254.169.254/32",
+          "169.254.0.0/16",
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "192.168.0.0/16",
+          "fd00::/8",
+          "fe80::/10"
+        ],
+        "outboundTag": "block"
+      }
+    ]
+  }
 }
 EOF
+  # Fail fast with a clear message if the config we just wrote is malformed,
+  # rather than letting it surface later as an opaque "service failed to
+  # start" from systemd.
+  if ! jq empty "$tmp_config" >/dev/null 2>&1; then
+    echo "ERROR: Generated config.json is not valid JSON. Not restarting xray." >&2
+    echo "  Broken draft left at ${tmp_config} for inspection." >&2
+    echo "  Existing config (if any) at ${CONFIG_FILE} was left untouched." >&2
+    exit 1
+  fi
+
+  # Atomic swap: rename is a single filesystem operation, so a crash here
+  # never leaves a half-written config.json -- you get the old one or the
+  # fully-written new one, never something in between.
+  mv -f "$tmp_config" "$CONFIG_FILE"
+
   mkdir -p /var/log/xray
   chown -R xray:xray /var/log/xray 2>/dev/null || true
 
@@ -235,22 +305,15 @@ EOF
   # service user rather than leaving it world-readable.
   chown root:xray "$CONFIG_FILE" 2>/dev/null || true
   chmod 640 "$CONFIG_FILE" 2>/dev/null || true
-
-  # Fail fast with a clear message if the config we just wrote is malformed,
-  # rather than letting it surface later as an opaque "service failed to
-  # start" from systemd.
-  if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
-    echo "ERROR: Generated config.json is not valid JSON. Not restarting xray." >&2
-    echo "  Check ${CONFIG_FILE} manually, or restore from ${BACKUP_ROOT}/." >&2
-    exit 1
-  fi
 }
 
 # ---------------------------------------------------------------------------
 # Helper: save state so future rotate/show runs remember settings
 # ---------------------------------------------------------------------------
 save_state() {
-  cat > "$STATE_FILE" <<EOF
+  local tmp_state
+  tmp_state=$(mktemp "${XRAY_CONFIG_DIR}/.reality-state.XXXXXX")
+  cat > "$tmp_state" <<EOF
 SNI_DOMAIN="${SNI_DOMAIN}"
 LISTEN_PORT="${LISTEN_PORT}"
 UUID="${UUID}"
@@ -259,7 +322,8 @@ PUBLIC_KEY="${PUBLIC_KEY}"
 SHORT_ID="${SHORT_ID}"
 SSH_PORT="${SSH_PORT}"
 EOF
-  chmod 600 "$STATE_FILE"
+  chmod 600 "$tmp_state"
+  mv -f "$tmp_state" "$STATE_FILE"
 }
 
 # ---------------------------------------------------------------------------
@@ -339,6 +403,60 @@ if [[ "$MODE" == "show" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# MODE: --list-backups  (read-only, no changes)
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "list-backups" ]]; then
+  if [[ ! -d "$BACKUP_ROOT" ]] || [[ -z "$(ls -A "$BACKUP_ROOT" 2>/dev/null)" ]]; then
+    echo "No backups found under ${BACKUP_ROOT}."
+    exit 0
+  fi
+  echo "Available backups (use with --restore <timestamp>):"
+  for dir in "$BACKUP_ROOT"/*/; do
+    ts=$(basename "$dir")
+    contents=$(ls "$dir" 2>/dev/null | tr '\n' ' ')
+    echo "  ${ts}   (${contents})"
+  done
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# MODE: --restore <timestamp>  (restore config + state from a prior backup)
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "restore" ]]; then
+  RESTORE_DIR="${BACKUP_ROOT}/${RESTORE_TS}"
+  if [[ ! -d "$RESTORE_DIR" ]]; then
+    echo "ERROR: No backup found at ${RESTORE_DIR}." >&2
+    echo "       Run --list-backups to see available timestamps." >&2
+    exit 1
+  fi
+  if [[ ! -f "${RESTORE_DIR}/config.json" ]]; then
+    echo "ERROR: ${RESTORE_DIR} doesn't contain a config.json -- can't restore from it." >&2
+    exit 1
+  fi
+
+  echo "=== Restoring from backup: ${RESTORE_TS} ==="
+  # Back up the current (about-to-be-overwritten) state too, so restoring
+  # is itself undoable.
+  backup_current_state
+
+  if ! jq empty "${RESTORE_DIR}/config.json" >/dev/null 2>&1; then
+    echo "ERROR: Backed-up config.json at ${RESTORE_DIR} is not valid JSON. Not restoring." >&2
+    exit 1
+  fi
+
+  cp -a "${RESTORE_DIR}/config.json" "$CONFIG_FILE"
+  chown root:xray "$CONFIG_FILE" 2>/dev/null || true
+  chmod 640 "$CONFIG_FILE" 2>/dev/null || true
+  [[ -f "${RESTORE_DIR}/state" ]] && cp -a "${RESTORE_DIR}/state" "$STATE_FILE" && chmod 600 "$STATE_FILE"
+  [[ -f "${RESTORE_DIR}/client-info.txt" ]] && cp -a "${RESTORE_DIR}/client-info.txt" "$CLIENT_INFO_FILE" && chmod 600 "$CLIENT_INFO_FILE"
+
+  restart_and_verify
+  echo ""
+  echo "Restored from ${RESTORE_TS}. Run --show to reprint the restored client link."
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # MODE: --rotate-uuid  (new UUID + short ID; keeps REALITY keypair)
 # ---------------------------------------------------------------------------
 if [[ "$MODE" == "rotate-uuid" ]]; then
@@ -407,7 +525,7 @@ fi
 echo "=== [2/9] Installing Xray-core (official installer) ==="
 XRAY_INSTALL_ATTEMPTS=3
 for attempt in $(seq 1 "$XRAY_INSTALL_ATTEMPTS"); do
-  if bash -c "$(curl -fsSL https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)" @ install; then
+  if bash -c "$(curl -fsSL --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)" @ install; then
     break
   fi
   if [[ "$attempt" -eq "$XRAY_INSTALL_ATTEMPTS" ]]; then
@@ -597,9 +715,6 @@ systemctl enable --now daily-reboot.timer
 # Copies the content (not a symlink), so it keeps working even if the
 # original downloaded copy is moved or deleted.
 #
-# If $0 isn't a real file (e.g. run via `bash <(curl -Ls ...)`, where $0
-# points to a process-substitution pipe, not a regular file), fall back
-# to re-downloading the script fresh from SCRIPT_SOURCE_URL instead.
 # Install a short-name copy so this script can be run as 'reality' from
 # anywhere, instead of needing to remember/find the original file path.
 # Copies the content (not a symlink), so it keeps working even if the
@@ -618,14 +733,23 @@ if [[ "$SELF_PATH" == "$REALITY_SHORTCUT_RESOLVED" ]]; then
 elif [[ -f "$SELF_PATH" ]]; then
   cp -f "$SELF_PATH" "$REALITY_SHORTCUT"
   chmod +x "$REALITY_SHORTCUT"
-elif curl -fsSL "$SCRIPT_SOURCE_URL" -o "$REALITY_SHORTCUT" 2>/dev/null; then
-  chmod +x "$REALITY_SHORTCUT"
 else
-  echo "WARNING: Could not install the 'reality' shortcut (this run wasn't from a" >&2
-  echo "         real file on disk, e.g. 'bash <(curl ...)', and re-downloading" >&2
-  echo "         from ${SCRIPT_SOURCE_URL} also failed)." >&2
-  echo "         Everything else succeeded -- to add the shortcut manually:" >&2
-  echo "           curl -fsSL ${SCRIPT_SOURCE_URL} -o ${REALITY_SHORTCUT} && chmod +x ${REALITY_SHORTCUT}" >&2
+  REALITY_SHORTCUT_TMP=$(mktemp)
+  if curl -fsSL --connect-timeout 10 --max-time 30 "$SCRIPT_SOURCE_URL" -o "$REALITY_SHORTCUT_TMP" 2>/dev/null \
+     && bash -n "$REALITY_SHORTCUT_TMP" 2>/dev/null; then
+    # Only install it once we've confirmed the download is complete and
+    # syntactically valid -- a truncated/partial download would otherwise
+    # silently replace a working shortcut with a broken one.
+    mv -f "$REALITY_SHORTCUT_TMP" "$REALITY_SHORTCUT"
+    chmod +x "$REALITY_SHORTCUT"
+  else
+    rm -f "$REALITY_SHORTCUT_TMP"
+    echo "WARNING: Could not install the 'reality' shortcut (this run wasn't from a" >&2
+    echo "         real file on disk, e.g. 'bash <(curl ...)', and re-downloading" >&2
+    echo "         from ${SCRIPT_SOURCE_URL} also failed or returned an incomplete file)." >&2
+    echo "         Everything else succeeded -- to add the shortcut manually:" >&2
+    echo "           curl -fsSL ${SCRIPT_SOURCE_URL} -o ${REALITY_SHORTCUT} && chmod +x ${REALITY_SHORTCUT}" >&2
+  fi
 fi
 
 # Everything above (config, firewall, fail2ban, sysctl, reboot timer) is
