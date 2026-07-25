@@ -338,6 +338,44 @@ restart_and_verify() {
     echo "ERROR: xray service failed to start. Check: journalctl -u xray -e" >&2
     exit 1
   fi
+  verify_handshake
+}
+
+# ---------------------------------------------------------------------------
+# Helper: best-effort network-level check that Xray is actually serving
+# REALITY correctly, not just that the process is running. "Active" in
+# systemd only means the process didn't crash -- it says nothing about
+# whether the port is reachable or the TLS handshake actually works.
+# Non-fatal: prints warnings rather than aborting, since this check can
+# have environmental false negatives (e.g. loopback quirks) that a real
+# remote client wouldn't hit.
+# ---------------------------------------------------------------------------
+verify_handshake() {
+  local port="${LISTEN_PORT:-443}"
+  local sni="${SNI_DOMAIN:-}"
+
+  if ! ss -tln 2>/dev/null | grep -q ":${port} "; then
+    echo "WARNING: Xray is active, but nothing appears to be listening on port ${port}." >&2
+    echo "         Check: ss -tlnp | grep ${port}" >&2
+    return 0
+  fi
+
+  if ! timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/${port}" 2>/dev/null; then
+    echo "WARNING: Port ${port} is listed as listening, but a local TCP connect failed." >&2
+    return 0
+  fi
+
+  if [[ -n "$sni" ]] && command -v openssl >/dev/null 2>&1; then
+    if ! timeout 5 bash -c "echo | openssl s_client -connect 127.0.0.1:${port} -servername '${sni}' 2>/dev/null" | grep -q "CONNECTED"; then
+      echo "WARNING: TCP connects, but a TLS handshake against 127.0.0.1:${port} (SNI: ${sni})" >&2
+      echo "         didn't complete cleanly. This can be a loopback/self-connect quirk --" >&2
+      echo "         test from a real client before assuming something's wrong. If a real" >&2
+      echo "         client also fails, check: journalctl -u xray -e" >&2
+      return 0
+    fi
+  fi
+
+  echo "Handshake check: port listening, TCP connects, TLS handshake completes."
 }
 
 # ---------------------------------------------------------------------------
@@ -561,13 +599,16 @@ write_config
 echo "=== [5/9] Hardening the systemd service ==="
 mkdir -p /etc/systemd/system/${SERVICE_NAME}.service.d
 cat > /etc/systemd/system/${SERVICE_NAME}.service.d/override.conf <<'EOF'
+[Unit]
+OnFailure=xray-alert.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
 [Service]
 User=xray
 Group=xray
 Restart=on-failure
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=5
 LimitCORE=0
 NoNewPrivileges=true
 PrivateTmp=true
@@ -584,15 +625,58 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 EOF
 
+# OnFailure= above fires once the restart-attempt budget (StartLimitBurst)
+# is exhausted and the service gives up -- not on every individual
+# transient restart. This is local-only (broadcasts to logged-in terminals
+# + a critical syslog entry): there's no email/webhook configured anywhere
+# in this setup, so this can't reach you remotely, only if you're logged
+# into the box or checking logs.
+cat > /etc/systemd/system/xray-alert.service <<'EOF'
+[Unit]
+Description=Local alert when xray.service exhausts its restart attempts
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'logger -p daemon.crit "xray.service has FAILED and exhausted its restart attempts -- check: journalctl -u xray -e"; wall "WARNING: xray.service has failed and given up restarting. Check: journalctl -u xray -e" || true'
+EOF
+
 # Reload the unit + drop-in now so the change is registered, but hold off
 # on actually restarting until every other step below has succeeded --
 # see the single restart_and_verify call at the very end of install mode.
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
 
+# REALITY's handshake validation is timestamp-sensitive -- clock drift
+# causes intermittent, confusing failures. Confirm NTP sync is active
+# rather than assuming the base image has it enabled.
+if command -v timedatectl >/dev/null 2>&1; then
+  if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" != "yes" ]]; then
+    timedatectl set-ntp true >/dev/null 2>&1 || true
+    sleep 2
+    if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" != "yes" ]]; then
+      echo "WARNING: System clock is not confirmed NTP-synchronized." >&2
+      echo "         REALITY handshakes are timestamp-sensitive; clock drift can cause" >&2
+      echo "         intermittent failures. Check: timedatectl status" >&2
+    fi
+  fi
+fi
+
 echo "=== [6/9] Configuring firewall (UFW) ==="
 SSH_PORT=$(ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed 's/.*://' | head -n1)
 SSH_PORT="${SSH_PORT:-22}"
+
+# If SSH was ever reconfigured to a different port through some other means,
+# an old rule for the previous port could still be sitting here, open
+# forever. Detect and flag it -- but don't auto-delete: this script can't
+# tell a genuinely stale rule apart from an intentional second SSH listener,
+# and getting that wrong risks locking you out.
+STALE_SSH_RULES=$(ufw status numbered 2>/dev/null | grep "SSH" | grep -v "${SSH_PORT}/tcp" || true)
+if [[ -n "$STALE_SSH_RULES" ]]; then
+  echo "NOTE: Found UFW rule(s) tagged 'SSH' for a port other than the current one (${SSH_PORT}):"
+  echo "$STALE_SSH_RULES"
+  echo "      If SSH used to run on a different port, this is probably stale and safe to"
+  echo "      remove with: ufw delete <rule number>   (run 'ufw status numbered' to check)"
+fi
 
 # Make sure UFW actually enforces IPv6 too -- if IPV6=no here, the rules
 # below only apply to IPv4 and a public IPv6 address (common on many VPS
@@ -623,6 +707,12 @@ fi
 ufw --force enable
 ufw reload
 
+if ! ufw status | grep -q "Status: active"; then
+  echo "ERROR: UFW did not report active after enabling. The firewall may not be" >&2
+  echo "       protecting this server. Check: ufw status verbose" >&2
+  exit 1
+fi
+
 echo "=== [7/9] Configuring fail2ban for SSH brute-force protection ==="
 cat > /etc/fail2ban/jail.d/sshd.local <<EOF
 [sshd]
@@ -634,6 +724,11 @@ findtime = 10m
 EOF
 systemctl enable fail2ban
 systemctl restart fail2ban
+sleep 1
+if ! systemctl is-active --quiet fail2ban; then
+  echo "WARNING: fail2ban did not come up after restart. SSH brute-force protection" >&2
+  echo "         is NOT active. Check: journalctl -u fail2ban -e" >&2
+fi
 
 echo "=== [8/9] Enabling BBR + basic kernel/network hardening ==="
 cat > /etc/sysctl.d/99-xray-hardening.conf <<'EOF'
@@ -662,6 +757,14 @@ net.ipv6.conf.default.accept_source_route = 0
 kernel.yama.ptrace_scope = 1
 EOF
 sysctl --system >/dev/null
+
+ACTIVE_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+if [[ "$ACTIVE_CC" != "bbr" ]]; then
+  echo "WARNING: Requested BBR but the kernel reports '${ACTIVE_CC}' as active." >&2
+  echo "         Likely cause: the tcp_bbr kernel module isn't available on this kernel." >&2
+  echo "         Check: modprobe tcp_bbr && sysctl net.ipv4.tcp_congestion_control=bbr" >&2
+  echo "         Not fatal -- proxy still works, just without BBR's throughput benefit." >&2
+fi
 
 # Cap the systemd journal's disk usage explicitly rather than trusting
 # whatever default the base image shipped with.
