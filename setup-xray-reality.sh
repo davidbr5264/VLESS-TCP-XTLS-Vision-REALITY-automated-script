@@ -39,6 +39,36 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
+# Terminal output helpers (auto-disabled when not a real terminal, e.g.
+# piped to a log file, or when NO_COLOR is set -- so output stays clean
+# either way rather than dumping raw escape codes into a logfile).
+# ---------------------------------------------------------------------------
+if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
+  C_RESET=$(tput sgr0); C_BOLD=$(tput bold)
+  C_RED=$(tput setaf 1); C_GREEN=$(tput setaf 2); C_YELLOW=$(tput setaf 3)
+  C_BLUE=$(tput setaf 4); C_CYAN=$(tput setaf 6)
+else
+  C_RESET=""; C_BOLD=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_CYAN=""
+fi
+
+banner() {
+  echo ""
+  echo "${C_CYAN}${C_BOLD}  ╔══════════════════════════════════════════════════════╗${C_RESET}"
+  echo "${C_CYAN}${C_BOLD}  ║    Xray VLESS · TCP · XTLS-Vision · REALITY Setup    ║${C_RESET}"
+  echo "${C_CYAN}${C_BOLD}  ╚══════════════════════════════════════════════════════╝${C_RESET}"
+  echo ""
+}
+
+step() {
+  echo ""
+  echo "${C_BLUE}${C_BOLD}==> [$1]${C_RESET} ${C_BOLD}$2${C_RESET}"
+}
+
+ok()   { echo "${C_GREEN}  ✓ $1${C_RESET}"; }
+warn() { echo "${C_YELLOW}  ⚠ WARNING:${C_RESET} $1" >&2; }
+err()  { echo "${C_RED}  ✗ ERROR:${C_RESET} $1" >&2; }
+
+# ---------------------------------------------------------------------------
 # Configuration (edit if needed, or override via environment variables)
 # ---------------------------------------------------------------------------
 SNI_DOMAIN_DEFAULT="${SNI_DOMAIN:-i.ytimg.com}"   # REALITY camouflage target
@@ -80,6 +110,8 @@ case "${1:-}" in
     exit 1
     ;;
 esac
+
+banner
 
 # ---------------------------------------------------------------------------
 # Preflight checks
@@ -335,9 +367,10 @@ restart_and_verify() {
   systemctl restart "${SERVICE_NAME}"
   sleep 1
   if ! systemctl is-active --quiet "${SERVICE_NAME}"; then
-    echo "ERROR: xray service failed to start. Check: journalctl -u xray -e" >&2
+    err "xray service failed to start. Check: journalctl -u xray -e"
     exit 1
   fi
+  ok "xray service is active"
   verify_handshake
 }
 
@@ -355,19 +388,19 @@ verify_handshake() {
   local sni="${SNI_DOMAIN:-}"
 
   if ! ss -tln 2>/dev/null | grep -q ":${port} "; then
-    echo "WARNING: Xray is active, but nothing appears to be listening on port ${port}." >&2
+    warn "Xray is active, but nothing appears to be listening on port ${port}."
     echo "         Check: ss -tlnp | grep ${port}" >&2
     return 0
   fi
 
   if ! timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/${port}" 2>/dev/null; then
-    echo "WARNING: Port ${port} is listed as listening, but a local TCP connect failed." >&2
+    warn "Port ${port} is listed as listening, but a local TCP connect failed."
     return 0
   fi
 
   if [[ -n "$sni" ]] && command -v openssl >/dev/null 2>&1; then
     if ! timeout 5 bash -c "echo | openssl s_client -connect 127.0.0.1:${port} -servername '${sni}' 2>/dev/null" | grep -q "CONNECTED"; then
-      echo "WARNING: TCP connects, but a TLS handshake against 127.0.0.1:${port} (SNI: ${sni})" >&2
+      warn "TCP connects, but a TLS handshake against 127.0.0.1:${port} (SNI: ${sni})"
       echo "         didn't complete cleanly. This can be a loopback/self-connect quirk --" >&2
       echo "         test from a real client before assuming something's wrong. If a real" >&2
       echo "         client also fails, check: journalctl -u xray -e" >&2
@@ -375,7 +408,7 @@ verify_handshake() {
     fi
   fi
 
-  echo "Handshake check: port listening, TCP connects, TLS handshake completes."
+  ok "Handshake check passed: port listening, TCP connects, TLS handshake completes."
 }
 
 # ---------------------------------------------------------------------------
@@ -418,17 +451,21 @@ Keep this file secret. It contains your private key.
 EOF
   chmod 600 "$CLIENT_INFO_FILE"
 
+  local status_now status_color
+  status_now=$(systemctl is-active ${SERVICE_NAME} 2>/dev/null || echo unknown)
+  if [[ "$status_now" == "active" ]]; then status_color="$C_GREEN"; else status_color="$C_YELLOW"; fi
+
   echo ""
-  echo "############################################################"
-  echo "  Service status : $(systemctl is-active ${SERVICE_NAME} 2>/dev/null || echo unknown)"
+  echo "${C_CYAN}############################################################${C_RESET}"
+  echo "  Service status : ${status_color}${status_now}${C_RESET}"
   echo "  Config file    : ${CONFIG_FILE}"
   echo "  Client info    : ${CLIENT_INFO_FILE} (chmod 600)"
-  echo "############################################################"
+  echo "${C_CYAN}############################################################${C_RESET}"
   echo ""
-  echo "Client link (import into v2rayN / NekoBox / Shadowrocket / etc.):"
-  echo "${vless_link}"
+  echo "${C_BOLD}Client link${C_RESET} (import into v2rayN / NekoBox / Shadowrocket / etc.):"
+  echo "${C_GREEN}${vless_link}${C_RESET}"
   echo ""
-  echo "QR code:"
+  echo "${C_BOLD}QR code:${C_RESET}"
   qrencode -t ansiutf8 "${vless_link}"
 }
 
@@ -536,7 +573,7 @@ fi
 # ---------------------------------------------------------------------------
 backup_current_state
 
-echo "=== [1/9] Preparing server (updates, cleanup, essential tools) ==="
+step "1/9" "Preparing server (updates, cleanup, essential tools)"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get upgrade -y
@@ -560,7 +597,7 @@ if [[ -f /var/run/reboot-required ]]; then
   echo "      or reboot manually now with: reboot"
 fi
 
-echo "=== [2/9] Installing Xray-core (official installer) ==="
+step "2/9" "Installing Xray-core (official installer)"
 XRAY_INSTALL_ATTEMPTS=3
 for attempt in $(seq 1 "$XRAY_INSTALL_ATTEMPTS"); do
   if bash -c "$(curl -fsSL --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)" @ install; then
@@ -576,7 +613,7 @@ done
 
 mkdir -p "$XRAY_CONFIG_DIR"
 
-echo "=== [3/9] Setting up credentials (UUID, REALITY keypair, short ID) ==="
+step "3/9" "Setting up credentials (UUID, REALITY keypair, short ID)"
 if [[ -n "$UUID" && -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" && -n "$SHORT_ID" ]]; then
   echo "Existing credentials found in ${STATE_FILE} -- reusing them (client links stay valid)."
   echo "Need fresh credentials instead? Use --rotate-uuid or --rotate-all, not a plain re-run."
@@ -593,10 +630,10 @@ if ! id -u xray >/dev/null 2>&1; then
   useradd --system --no-create-home --shell /usr/sbin/nologin xray
 fi
 
-echo "=== [4/9] Writing Xray config (privacy-minded: no access logging) ==="
+step "4/9" "Writing Xray config (privacy-minded: no access logging)"
 write_config
 
-echo "=== [5/9] Hardening the systemd service ==="
+step "5/9" "Hardening the systemd service"
 mkdir -p /etc/systemd/system/${SERVICE_NAME}.service.d
 cat > /etc/systemd/system/${SERVICE_NAME}.service.d/override.conf <<'EOF'
 [Unit]
@@ -661,7 +698,7 @@ if command -v timedatectl >/dev/null 2>&1; then
   fi
 fi
 
-echo "=== [6/9] Configuring firewall (UFW) ==="
+step "6/9" "Configuring firewall (UFW)"
 SSH_PORT=$(ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed 's/.*://' | head -n1)
 SSH_PORT="${SSH_PORT:-22}"
 
@@ -713,7 +750,7 @@ if ! ufw status | grep -q "Status: active"; then
   exit 1
 fi
 
-echo "=== [7/9] Configuring fail2ban for SSH brute-force protection ==="
+step "7/9" "Configuring fail2ban for SSH brute-force protection"
 cat > /etc/fail2ban/jail.d/sshd.local <<EOF
 [sshd]
 enabled = true
@@ -730,7 +767,7 @@ if ! systemctl is-active --quiet fail2ban; then
   echo "         is NOT active. Check: journalctl -u fail2ban -e" >&2
 fi
 
-echo "=== [8/9] Enabling BBR + basic kernel/network hardening ==="
+step "8/9" "Enabling BBR + basic kernel/network hardening"
 cat > /etc/sysctl.d/99-xray-hardening.conf <<'EOF'
 # Congestion control
 net.core.default_qdisc = fq
@@ -788,7 +825,7 @@ cat > /etc/logrotate.d/xray <<'EOF'
 }
 EOF
 
-echo "=== [9/9] Setting up daily reboot at midnight ==="
+step "9/9" "Setting up daily reboot at midnight"
 cat > /etc/systemd/system/daily-reboot.service <<'EOF'
 [Unit]
 Description=Daily scheduled reboot
@@ -862,16 +899,15 @@ save_state
 output_client_info
 
 echo ""
-echo "Setup complete. Server will reboot daily at 00:00 (server local time)."
+echo "${C_GREEN}${C_BOLD}✓ Setup complete.${C_RESET} Server will reboot daily at 00:00 (server local time)."
 echo "Check timezone with: timedatectl   (change with: timedatectl set-timezone <Region/City>)"
 echo "Cancel the daily reboot with: systemctl disable --now daily-reboot.timer"
 echo ""
-echo "Re-run any time (works via either name, from any directory):"
-echo "  reality                 -> re-apply full setup (backs up old config first)"
-echo "  reality --rotate-uuid   -> revoke current client link, keep server identity"
-echo "  reality --rotate-all    -> full credential reset (invalidates everything)"
-echo "  reality --show          -> reprint current client link + QR"
+echo "${C_BOLD}Re-run any time${C_RESET} (works via either name, from any directory):"
+echo "  ${C_CYAN}reality${C_RESET}                 -> re-apply full setup (backs up old config first)"
+echo "  ${C_CYAN}reality --rotate-uuid${C_RESET}   -> revoke current client link, keep server identity"
+echo "  ${C_CYAN}reality --rotate-all${C_RESET}    -> full credential reset (invalidates everything)"
+echo "  ${C_CYAN}reality --show${C_RESET}          -> reprint current client link + QR"
 
-echo ""
-echo "=== Restarting Xray with final configuration ==="
+step "final" "Restarting Xray with final configuration"
 restart_and_verify
