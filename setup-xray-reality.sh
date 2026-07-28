@@ -296,11 +296,11 @@ write_config() {
         "decryption": "none"
       },
       "streamSettings": {
-        "network": "tcp",
+        "network": "raw",
         "security": "reality",
         "realitySettings": {
           "show": false,
-          "dest": "${SNI_DOMAIN}:443",
+          "target": "${SNI_DOMAIN}:443",
           "xver": 0,
           "serverNames": ["${SNI_DOMAIN}"],
           "privateKey": "${PRIVATE_KEY}",
@@ -323,10 +323,16 @@ write_config() {
     },
     {
       "protocol": "blackhole",
-      "tag": "block"
+      "tag": "block",
+      "settings": {
+        "response": {
+          "type": "none"
+        }
+      }
     }
   ],
   "routing": {
+    "domainStrategy": "IPIfNonMatch",
     "rules": [
       {
         "type": "field",
