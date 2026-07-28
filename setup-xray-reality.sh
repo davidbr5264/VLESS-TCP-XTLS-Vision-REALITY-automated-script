@@ -370,7 +370,7 @@ EOF
   chown -R xray:xray /var/log/xray 2>/dev/null || true
 
   if command -v xray >/dev/null 2>&1; then
-    if ! XRAY_TEST_OUTPUT=$(xray run -test -config "$tmp_config" 2>&1); then
+    if ! XRAY_TEST_OUTPUT=$(xray run -test -format json -config "$tmp_config" 2>&1); then
       err "Xray rejected the generated config (schema/field error, not a JSON syntax error):"
       echo "$XRAY_TEST_OUTPUT" | sed 's/^/  /' >&2
       echo "  Broken draft left at ${tmp_config} for inspection." >&2
