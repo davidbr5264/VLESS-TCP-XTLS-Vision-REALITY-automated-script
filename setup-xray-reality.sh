@@ -122,8 +122,22 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 if [[ "$MODE" != "install" ]] && ! command -v xray >/dev/null 2>&1; then
-  echo "ERROR: Xray is not installed yet. Run the script with no arguments first." >&2
+  err "Xray is not installed yet. Run the script with no arguments first."
   exit 1
+fi
+
+# Non-install modes (rotate/show/restore) rely on jq, openssl, and
+# qrencode, but only ever checked that xray itself exists. If any of
+# these went missing after the initial install, the failure should be a
+# clear message here, not a bare "command not found" partway through.
+if [[ "$MODE" != "install" ]]; then
+  for dep in jq openssl qrencode; do
+    if ! command -v "$dep" >/dev/null 2>&1; then
+      err "Required tool '${dep}' is missing (it should have been installed already)."
+      echo "       Reinstall it with: apt-get install -y ${dep}" >&2
+      exit 1
+    fi
+  done
 fi
 
 if [[ "$MODE" == "install" ]] && ! command -v apt-get >/dev/null 2>&1; then
@@ -157,8 +171,24 @@ SHORT_ID=""
 SSH_PORT=""
 
 if [[ -f "$STATE_FILE" ]]; then
+  # Existing state always wins over env var defaults, on purpose -- this is
+  # what makes plain re-runs preserve credentials instead of regenerating
+  # them. But that means SNI_DOMAIN=/LISTEN_PORT=... env vars silently do
+  # nothing on an existing install, which is confusing without a message.
+  # There's currently no supported way to change just the SNI or port
+  # without a full --rotate-all (which also regenerates the keypair).
   # shellcheck disable=SC1090
   source "$STATE_FILE"
+
+  if [[ "$SNI_DOMAIN_DEFAULT" != "i.ytimg.com" && "$SNI_DOMAIN_DEFAULT" != "$SNI_DOMAIN" ]]; then
+    warn "SNI_DOMAIN env var ('${SNI_DOMAIN_DEFAULT}') was set, but an existing install already"
+    echo "         uses '${SNI_DOMAIN}' -- existing state always wins, so the env var was ignored." >&2
+    echo "         There's no way to change just the SNI without --rotate-all (full reset)." >&2
+  fi
+  if [[ "$LISTEN_PORT_DEFAULT" != "443" && "$LISTEN_PORT_DEFAULT" != "$LISTEN_PORT" ]]; then
+    warn "LISTEN_PORT env var ('${LISTEN_PORT_DEFAULT}') was set, but an existing install already"
+    echo "         uses port ${LISTEN_PORT} -- existing state always wins, so the env var was ignored." >&2
+  fi
 fi
 
 if [[ "$MODE" == "show" ]]; then
@@ -319,19 +349,40 @@ EOF
   # rather than letting it surface later as an opaque "service failed to
   # start" from systemd.
   if ! jq empty "$tmp_config" >/dev/null 2>&1; then
-    echo "ERROR: Generated config.json is not valid JSON. Not restarting xray." >&2
+    err "Generated config.json is not valid JSON. Not restarting xray."
     echo "  Broken draft left at ${tmp_config} for inspection." >&2
     echo "  Existing config (if any) at ${CONFIG_FILE} was left untouched." >&2
     exit 1
+  fi
+
+  # jq only confirms valid JSON syntax -- it says nothing about whether
+  # Xray's own schema actually accepts the field names/structure. Xray-core
+  # has a real config-test mode built for exactly this; use it so a typo'd
+  # field surfaces here with a clear message, not as a cryptic runtime
+  # failure from systemd later.
+  #
+  # NOTE: the log directory must exist before this runs -- the config
+  # references /var/log/xray/error.log, and xray -test fails to even load
+  # the config if that path's parent directory doesn't exist yet (confirmed
+  # by testing against a real xray-core binary: this order bug would have
+  # broken every fresh install otherwise).
+  mkdir -p /var/log/xray
+  chown -R xray:xray /var/log/xray 2>/dev/null || true
+
+  if command -v xray >/dev/null 2>&1; then
+    if ! XRAY_TEST_OUTPUT=$(xray run -test -config "$tmp_config" 2>&1); then
+      err "Xray rejected the generated config (schema/field error, not a JSON syntax error):"
+      echo "$XRAY_TEST_OUTPUT" | sed 's/^/  /' >&2
+      echo "  Broken draft left at ${tmp_config} for inspection." >&2
+      echo "  Existing config (if any) at ${CONFIG_FILE} was left untouched." >&2
+      exit 1
+    fi
   fi
 
   # Atomic swap: rename is a single filesystem operation, so a crash here
   # never leaves a half-written config.json -- you get the old one or the
   # fully-written new one, never something in between.
   mv -f "$tmp_config" "$CONFIG_FILE"
-
-  mkdir -p /var/log/xray
-  chown -R xray:xray /var/log/xray 2>/dev/null || true
 
   # Config contains the REALITY private key -- restrict to root + the xray
   # service user rather than leaving it world-readable.
@@ -628,6 +679,18 @@ fi
 # file's ownership can be set correctly on first install.
 if ! id -u xray >/dev/null 2>&1; then
   useradd --system --no-create-home --shell /usr/sbin/nologin xray
+fi
+
+# Catch a port conflict here with a clear message, rather than letting it
+# surface later as a generic "service failed to start". A listener that IS
+# our own xray (e.g. a re-run on an already-running instance) is expected
+# and fine; anything else bound to this port is a real conflict.
+PORT_HOLDER=$(ss -tlnp 2>/dev/null | awk -v p=":${LISTEN_PORT}\$" '$4 ~ p {print}')
+if [[ -n "$PORT_HOLDER" ]] && ! echo "$PORT_HOLDER" | grep -qi "xray"; then
+  err "Port ${LISTEN_PORT} is already in use by something other than Xray:"
+  echo "$PORT_HOLDER" | sed 's/^/  /' >&2
+  echo "  Stop that service first, or choose a different port (LISTEN_PORT=... env var)." >&2
+  exit 1
 fi
 
 step "4/9" "Writing Xray config (privacy-minded: no access logging)"
