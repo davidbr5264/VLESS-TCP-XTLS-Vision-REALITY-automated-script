@@ -16,6 +16,9 @@
 #   ./setup-xray-reality.sh --show         Reprint the current client link/QR
 #                                           without changing anything
 #   ./setup-xray-reality.sh --list-backups List available backups with timestamps
+#   ./setup-xray-reality.sh --dedupe-backups Remove redundant backups where a
+#                                           consecutive run has identical config
+#                                           (keeps the most recent of each run)
 #   ./setup-xray-reality.sh --restore TS   Restore config/state from a backup
 #                                           (backs up current state first)
 #   ./setup-xray-reality.sh --help         Show this help
@@ -92,6 +95,7 @@ case "${1:-}" in
   --rotate-all)    MODE="rotate-all" ;;
   --show)          MODE="show" ;;
   --list-backups)  MODE="list-backups" ;;
+  --dedupe-backups) MODE="dedupe-backups" ;;
   --restore)
     MODE="restore"
     RESTORE_TS="${2:-}"
@@ -101,7 +105,7 @@ case "${1:-}" in
     fi
     ;;
   --help|-h)
-    sed -n '2,38p' "$0"
+    sed -n '2,41p' "$0"
     exit 0
     ;;
   "") ;;
@@ -570,6 +574,57 @@ if [[ "$MODE" == "list-backups" ]]; then
     contents=$(ls "$dir" 2>/dev/null | tr '\n' ' ')
     echo "  ${ts}   (${contents})"
   done
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# MODE: --dedupe-backups  (remove redundant consecutive-duplicate backups)
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "dedupe-backups" ]]; then
+  if [[ ! -d "$BACKUP_ROOT" ]] || [[ -z "$(ls -A "$BACKUP_ROOT" 2>/dev/null)" ]]; then
+    echo "No backups found under ${BACKUP_ROOT}."
+    exit 0
+  fi
+
+  step "dedupe" "Scanning backups for redundant consecutive duplicates"
+
+  # Only collapses a *consecutive run* of identical config.json content
+  # (e.g. from repeated no-op 'reality' re-runs before the backup-skip fix)
+  # down to the most recent one in that run. Two backups with matching
+  # content that AREN'T consecutive -- meaning something changed and then
+  # changed back -- are left alone, since they represent genuinely
+  # different points in history that happen to coincide.
+  mapfile -t ALL_BACKUPS < <(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d | sort)
+
+  PREV_HASH=""
+  PREV_DIR=""
+  REMOVED_COUNT=0
+  KEPT_COUNT=0
+
+  for dir in "${ALL_BACKUPS[@]}"; do
+    if [[ ! -f "${dir}/config.json" ]]; then
+      # No config.json to compare -- leave it alone, don't guess.
+      PREV_HASH=""
+      PREV_DIR=""
+      continue
+    fi
+    CURRENT_HASH=$(sha256sum "${dir}/config.json" 2>/dev/null | awk '{print $1}')
+
+    if [[ -n "$PREV_HASH" && "$CURRENT_HASH" == "$PREV_HASH" ]]; then
+      # This one matches the previous one in sequence -- the previous
+      # backup is now redundant (this one is strictly newer with the
+      # same content), so remove the previous one and keep this one as
+      # the new "most recent representative" of the run.
+      rm -rf "$PREV_DIR"
+      REMOVED_COUNT=$((REMOVED_COUNT + 1))
+    else
+      KEPT_COUNT=$((KEPT_COUNT + 1))
+    fi
+    PREV_HASH="$CURRENT_HASH"
+    PREV_DIR="$dir"
+  done
+
+  ok "Removed ${REMOVED_COUNT} redundant backup(s), kept ${KEPT_COUNT}."
   exit 0
 fi
 
