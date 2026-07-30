@@ -628,6 +628,33 @@ fi
 # ---------------------------------------------------------------------------
 # MODE: install (default) — full setup, safe to re-run
 # ---------------------------------------------------------------------------
+
+# Only prompt for a custom SNI on a genuinely first-time install (no UUID
+# yet means no existing state) and only when there's an actual interactive
+# terminal to prompt on -- piped/scripted/non-interactive runs just fall
+# through to the existing default (env var override, or i.ytimg.com).
+if [[ -z "$UUID" ]] && [[ -t 0 ]]; then
+  echo ""
+  echo "${C_BOLD}REALITY camouflage target (SNI)${C_RESET}"
+  echo "This is the real site Xray impersonates during the TLS handshake."
+  echo "It should be a real TLS1.3 site, not a huge one (avoid google.com/"
+  echo "microsoft.com-scale sites -- large certs can trip protocol issues,"
+  echo "and CDN-fronted domains make REALITY easier to fingerprint)."
+  read -r -p "Domain to use [${SNI_DOMAIN}]: " SNI_INPUT
+  if [[ -n "$SNI_INPUT" ]]; then
+    # Basic sanitization in case someone pastes a full URL by mistake:
+    # strip scheme, path, port, and trailing slashes -- keep just the host.
+    SNI_INPUT="${SNI_INPUT#http://}"
+    SNI_INPUT="${SNI_INPUT#https://}"
+    SNI_INPUT="${SNI_INPUT%%/*}"
+    SNI_INPUT="${SNI_INPUT%%:*}"
+    if [[ -n "$SNI_INPUT" ]]; then
+      SNI_DOMAIN="$SNI_INPUT"
+    fi
+  fi
+  echo "Using: ${C_CYAN}${SNI_DOMAIN}${C_RESET}"
+fi
+
 backup_current_state
 
 step "1/9" "Preparing server (updates, cleanup, essential tools)"
