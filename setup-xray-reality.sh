@@ -662,6 +662,30 @@ fi
 # MODE: install (default) — full setup, safe to re-run
 # ---------------------------------------------------------------------------
 
+# Best-effort check: is the copy of this script actually running (e.g. the
+# installed 'reality' shortcut) behind what's currently on GitHub? This is
+# a NOTIFICATION only -- it never replaces or modifies the running script
+# (self-modifying a script mid-execution is a real footgun: truncated
+# reads, races). It just tells you clearly if you're out of date and how
+# to fix it. Silently skipped if $0 isn't a real file (e.g. piped via
+# process substitution -- that path already always re-downloads fresh) or
+# if GitHub isn't reachable within a few seconds.
+SELF_UPDATE_CHECK_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
+if [[ -f "$SELF_UPDATE_CHECK_PATH" ]]; then
+  REMOTE_SCRIPT_TMP=$(mktemp)
+  if curl -fsSL --connect-timeout 5 --max-time 10 "$SCRIPT_SOURCE_URL" -o "$REMOTE_SCRIPT_TMP" 2>/dev/null \
+     && bash -n "$REMOTE_SCRIPT_TMP" 2>/dev/null; then
+    LOCAL_HASH=$(sha256sum "$SELF_UPDATE_CHECK_PATH" 2>/dev/null | awk '{print $1}')
+    REMOTE_HASH=$(sha256sum "$REMOTE_SCRIPT_TMP" 2>/dev/null | awk '{print $1}')
+    if [[ -n "$LOCAL_HASH" && -n "$REMOTE_HASH" && "$LOCAL_HASH" != "$REMOTE_HASH" ]]; then
+      warn "This copy of the script is out of date (differs from ${SCRIPT_SOURCE_URL})."
+      echo "         Update with: bash <(curl -Ls ${SCRIPT_SOURCE_URL})" >&2
+      echo "         Continuing with the current (older) copy for this run." >&2
+    fi
+  fi
+  rm -f "$REMOTE_SCRIPT_TMP"
+fi
+
 # Only prompt for a custom SNI on a genuinely first-time install (no UUID
 # yet means no existing state) and only when there's an actual interactive
 # terminal to prompt on -- piped/scripted/non-interactive runs just fall
