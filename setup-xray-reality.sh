@@ -121,6 +121,18 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
+# Prevent two concurrent runs (e.g. accidentally launched in two terminals)
+# from racing on the same config/backup/state files. Held for the life of
+# this process; released automatically on exit, including on error.
+LOCK_FILE="/var/lock/reality-setup.lock"
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+  err "Another run of this script appears to be in progress (lock: ${LOCK_FILE})."
+  echo "       Wait for it to finish, or remove the lock file if you're sure nothing" >&2
+  echo "       is actually running: rm -f ${LOCK_FILE}" >&2
+  exit 1
+fi
+
 if [[ "$MODE" != "install" ]] && ! command -v xray >/dev/null 2>&1; then
   err "Xray is not installed yet. Run the script with no arguments first."
   exit 1
@@ -282,7 +294,7 @@ write_config() {
   },
   "inbounds": [
     {
-      "listen": "0.0.0.0",
+      "listen": "::",
       "port": ${LISTEN_PORT},
       "protocol": "vless",
       "settings": {
@@ -576,6 +588,18 @@ if [[ "$MODE" == "restore" ]]; then
     exit 1
   fi
 
+  # Same schema-level check write_config uses -- jq only confirms JSON
+  # syntax, not that Xray's own schema still accepts this backup (e.g. if
+  # it predates a field rename). Format must be specified explicitly since
+  # this path doesn't end in .json.
+  if command -v xray >/dev/null 2>&1; then
+    if ! RESTORE_TEST_OUTPUT=$(xray run -test -format json -config "${RESTORE_DIR}/config.json" 2>&1); then
+      err "Backed-up config.json at ${RESTORE_DIR} fails Xray's own schema check. Not restoring:"
+      echo "$RESTORE_TEST_OUTPUT" | sed 's/^/  /' >&2
+      exit 1
+    fi
+  fi
+
   cp -a "${RESTORE_DIR}/config.json" "$CONFIG_FILE"
   chown root:xray "$CONFIG_FILE" 2>/dev/null || true
   chmod 640 "$CONFIG_FILE" 2>/dev/null || true
@@ -612,6 +636,15 @@ fi
 # MODE: --rotate-all  (new UUID + short ID + REALITY keypair)
 # ---------------------------------------------------------------------------
 if [[ "$MODE" == "rotate-all" ]]; then
+  if [[ -t 0 ]]; then
+    echo ""
+    warn "This invalidates EVERY existing client link. Not undoable except by --restore."
+    read -r -p "Type 'yes' to continue: " CONFIRM_ROTATE_ALL
+    if [[ "$CONFIRM_ROTATE_ALL" != "yes" ]]; then
+      echo "Cancelled. No changes made."
+      exit 0
+    fi
+  fi
   step "rotate-all" "Rotating ALL credentials (UUID, short ID, REALITY keypair)"
   backup_current_state
   generate_uuid_and_shortid
@@ -634,24 +667,47 @@ fi
 # terminal to prompt on -- piped/scripted/non-interactive runs just fall
 # through to the existing default (env var override, or i.ytimg.com).
 if [[ -z "$UUID" ]] && [[ -t 0 ]]; then
-  echo ""
-  echo "${C_BOLD}REALITY camouflage target (SNI)${C_RESET}"
-  echo "This is the real site Xray impersonates during the TLS handshake."
-  echo "It should be a real TLS1.3 site, not a huge one (avoid google.com/"
-  echo "microsoft.com-scale sites -- large certs can trip protocol issues,"
-  echo "and CDN-fronted domains make REALITY easier to fingerprint)."
-  read -r -p "Domain to use [${SNI_DOMAIN}]: " SNI_INPUT
-  if [[ -n "$SNI_INPUT" ]]; then
-    # Basic sanitization in case someone pastes a full URL by mistake:
-    # strip scheme, path, port, and trailing slashes -- keep just the host.
-    SNI_INPUT="${SNI_INPUT#http://}"
-    SNI_INPUT="${SNI_INPUT#https://}"
-    SNI_INPUT="${SNI_INPUT%%/*}"
-    SNI_INPUT="${SNI_INPUT%%:*}"
+  while true; do
+    echo ""
+    echo "${C_BOLD}REALITY camouflage target (SNI)${C_RESET}"
+    echo "This is the real site Xray impersonates during the TLS handshake."
+    echo "It should be a real TLS1.3 site, not a huge one (avoid google.com/"
+    echo "microsoft.com-scale sites -- large certs can trip protocol issues,"
+    echo "and CDN-fronted domains make REALITY easier to fingerprint)."
+    read -r -p "Domain to use [${SNI_DOMAIN}]: " SNI_INPUT
     if [[ -n "$SNI_INPUT" ]]; then
-      SNI_DOMAIN="$SNI_INPUT"
+      # Basic sanitization in case someone pastes a full URL by mistake:
+      # strip scheme, path, port, and trailing slashes -- keep just the host.
+      SNI_INPUT="${SNI_INPUT#http://}"
+      SNI_INPUT="${SNI_INPUT#https://}"
+      SNI_INPUT="${SNI_INPUT%%/*}"
+      SNI_INPUT="${SNI_INPUT%%:*}"
+      if [[ -n "$SNI_INPUT" ]]; then
+        SNI_DOMAIN="$SNI_INPUT"
+      fi
     fi
-  fi
+
+    # Best-effort live check: does this domain actually resolve and serve
+    # TLS1.3 on 443? openssl may not be installed yet this early (that
+    # happens in step 1 below) -- skip the check gracefully if so, rather
+    # than block on a tool that isn't there yet.
+    if command -v openssl >/dev/null 2>&1; then
+      if timeout 6 openssl s_client -connect "${SNI_DOMAIN}:443" -servername "${SNI_DOMAIN}" -tls1_3 </dev/null >/dev/null 2>&1; then
+        ok "Confirmed: ${SNI_DOMAIN} resolves and serves TLS1.3 on port 443."
+        break
+      else
+        warn "Couldn't confirm ${SNI_DOMAIN} serves TLS1.3 on port 443 (DNS failure, no"
+        echo "         response, or TLS1.3 unsupported). REALITY requires this to work." >&2
+        read -r -p "Use it anyway? (y/N): " SNI_FORCE
+        if [[ "$SNI_FORCE" =~ ^[Yy]$ ]]; then
+          break
+        fi
+        # loop back and re-prompt
+      fi
+    else
+      break
+    fi
+  done
   echo "Using: ${C_CYAN}${SNI_DOMAIN}${C_RESET}"
 fi
 
