@@ -96,7 +96,7 @@ case "${1:-}" in
     MODE="restore"
     RESTORE_TS="${2:-}"
     if [[ -z "$RESTORE_TS" ]]; then
-      echo "ERROR: --restore requires a timestamp. See --list-backups for available ones." >&2
+      err "--restore requires a timestamp. See --list-backups for available ones."
       exit 1
     fi
     ;;
@@ -106,7 +106,7 @@ case "${1:-}" in
     ;;
   "") ;;
   *)
-    echo "ERROR: Unknown argument '$1'. Use --help for usage." >&2
+    err "Unknown argument '$1'. Use --help for usage."
     exit 1
     ;;
 esac
@@ -117,7 +117,7 @@ banner
 # Preflight checks
 # ---------------------------------------------------------------------------
 if [[ $EUID -ne 0 ]]; then
-  echo "ERROR: This script must be run as root (use sudo)." >&2
+  err "This script must be run as root (use sudo)."
   exit 1
 fi
 
@@ -141,7 +141,7 @@ if [[ "$MODE" != "install" ]]; then
 fi
 
 if [[ "$MODE" == "install" ]] && ! command -v apt-get >/dev/null 2>&1; then
-  echo "ERROR: This script only supports Debian/Ubuntu (apt-based) systems." >&2
+  err "This script only supports Debian/Ubuntu (apt-based) systems."
   exit 1
 fi
 
@@ -151,7 +151,7 @@ if [[ "$MODE" == "install" ]]; then
   AVAILABLE_KB=$(df --output=avail / 2>/dev/null | tail -n1 | tr -d ' ')
   MIN_REQUIRED_KB=1048576  # 1GB
   if [[ -n "$AVAILABLE_KB" ]] && [[ "$AVAILABLE_KB" -lt "$MIN_REQUIRED_KB" ]]; then
-    echo "ERROR: Less than 1GB free on / (found $((AVAILABLE_KB / 1024))MB)." >&2
+    err "Less than 1GB free on / (found $((AVAILABLE_KB / 1024))MB)."
     echo "       apt upgrades, Xray-core, and logs need headroom to install safely." >&2
     echo "       Free up space first (e.g. 'apt autoremove --purge -y'), then re-run." >&2
     exit 1
@@ -193,7 +193,7 @@ fi
 
 if [[ "$MODE" == "show" ]]; then
   if [[ -z "$UUID" || -z "$PUBLIC_KEY" ]]; then
-    echo "ERROR: No saved state found (${STATE_FILE}). Run a full install first." >&2
+    err "No saved state found (${STATE_FILE}). Run a full install first."
     exit 1
   fi
 fi
@@ -229,10 +229,10 @@ backup_current_state() {
 # Helper: generate UUID + short ID (used by install and --rotate-uuid)
 # ---------------------------------------------------------------------------
 generate_uuid_and_shortid() {
-  UUID=$(xray uuid) || { echo "ERROR: 'xray uuid' command failed to run." >&2; exit 1; }
+  UUID=$(xray uuid) || { err "'xray uuid' command failed to run."; exit 1; }
   SHORT_ID=$(openssl rand -hex 8)
   if [[ -z "$UUID" || -z "$SHORT_ID" ]]; then
-    echo "ERROR: Failed to generate UUID or short ID." >&2
+    err "Failed to generate UUID or short ID."
     exit 1
   fi
 }
@@ -245,13 +245,13 @@ generate_uuid_and_shortid() {
 # ---------------------------------------------------------------------------
 generate_reality_keypair() {
   local key_output
-  key_output=$(xray x25519) || { echo "ERROR: 'xray x25519' command failed to run." >&2; exit 1; }
+  key_output=$(xray x25519) || { err "'xray x25519' command failed to run."; exit 1; }
 
   PRIVATE_KEY=$(echo "$key_output" | grep -Ei '^[[:space:]]*(Private ?[Kk]ey)[[:space:]]*:' | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d ' \r' || true)
   PUBLIC_KEY=$(echo "$key_output" | grep -Ei '^[[:space:]]*(Public ?[Kk]ey|Password)([[:space:]]*\(.*\))?[[:space:]]*:' | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d ' \r' || true)
 
   if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-    echo "ERROR: Failed to parse REALITY keypair." >&2
+    err "Failed to parse REALITY keypair."
     echo "  PRIVATE_KEY=${PRIVATE_KEY:-<empty>}" >&2
     echo "  PUBLIC_KEY=${PUBLIC_KEY:-<empty>}" >&2
     echo "  Raw 'xray x25519' output was:" >&2
@@ -480,7 +480,7 @@ output_client_info() {
   server_ip=$(echo "$server_ip" | tr -d '[:space:]')
 
   if [[ -z "$server_ip" ]]; then
-    echo "WARNING: Could not determine the server's public IP (all lookup services unreachable)." >&2
+    warn "Could not determine the server's public IP (all lookup services unreachable)."
     echo "         Everything else succeeded -- find your IP manually (e.g. 'curl ifconfig.me' or" >&2
     echo "         your VPS provider's dashboard) and substitute it into the link below." >&2
     server_ip="YOUR_SERVER_IP"
@@ -557,22 +557,22 @@ fi
 if [[ "$MODE" == "restore" ]]; then
   RESTORE_DIR="${BACKUP_ROOT}/${RESTORE_TS}"
   if [[ ! -d "$RESTORE_DIR" ]]; then
-    echo "ERROR: No backup found at ${RESTORE_DIR}." >&2
+    err "No backup found at ${RESTORE_DIR}."
     echo "       Run --list-backups to see available timestamps." >&2
     exit 1
   fi
   if [[ ! -f "${RESTORE_DIR}/config.json" ]]; then
-    echo "ERROR: ${RESTORE_DIR} doesn't contain a config.json -- can't restore from it." >&2
+    err "${RESTORE_DIR} doesn't contain a config.json -- can't restore from it."
     exit 1
   fi
 
-  echo "=== Restoring from backup: ${RESTORE_TS} ==="
+  step "restore" "Restoring from backup: ${RESTORE_TS}"
   # Back up the current (about-to-be-overwritten) state too, so restoring
   # is itself undoable.
   backup_current_state
 
   if ! jq empty "${RESTORE_DIR}/config.json" >/dev/null 2>&1; then
-    echo "ERROR: Backed-up config.json at ${RESTORE_DIR} is not valid JSON. Not restoring." >&2
+    err "Backed-up config.json at ${RESTORE_DIR} is not valid JSON. Not restoring."
     exit 1
   fi
 
@@ -592,9 +592,9 @@ fi
 # MODE: --rotate-uuid  (new UUID + short ID; keeps REALITY keypair)
 # ---------------------------------------------------------------------------
 if [[ "$MODE" == "rotate-uuid" ]]; then
-  echo "=== Rotating UUID + short ID (REALITY keypair unchanged) ==="
+  step "rotate-uuid" "Rotating UUID + short ID (REALITY keypair unchanged)"
   if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-    echo "ERROR: No existing REALITY keypair found in state. Run a full install first." >&2
+    err "No existing REALITY keypair found in state. Run a full install first."
     exit 1
   fi
   backup_current_state
@@ -612,7 +612,7 @@ fi
 # MODE: --rotate-all  (new UUID + short ID + REALITY keypair)
 # ---------------------------------------------------------------------------
 if [[ "$MODE" == "rotate-all" ]]; then
-  echo "=== Rotating ALL credentials (UUID, short ID, REALITY keypair) ==="
+  step "rotate-all" "Rotating ALL credentials (UUID, short ID, REALITY keypair)"
   backup_current_state
   generate_uuid_and_shortid
   generate_reality_keypair
@@ -688,7 +688,7 @@ for attempt in $(seq 1 "$XRAY_INSTALL_ATTEMPTS"); do
     break
   fi
   if [[ "$attempt" -eq "$XRAY_INSTALL_ATTEMPTS" ]]; then
-    echo "ERROR: Failed to install Xray-core after ${XRAY_INSTALL_ATTEMPTS} attempts (likely a network issue reaching GitHub)." >&2
+    err "Failed to install Xray-core after ${XRAY_INSTALL_ATTEMPTS} attempts (likely a network issue reaching GitHub)."
     exit 1
   fi
   echo "Xray-core install attempt ${attempt} failed, retrying in 5s..."
@@ -787,7 +787,7 @@ if command -v timedatectl >/dev/null 2>&1; then
     timedatectl set-ntp true >/dev/null 2>&1 || true
     sleep 2
     if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" != "yes" ]]; then
-      echo "WARNING: System clock is not confirmed NTP-synchronized." >&2
+      warn "System clock is not confirmed NTP-synchronized."
       echo "         REALITY handshakes are timestamp-sensitive; clock drift can cause" >&2
       echo "         intermittent failures. Check: timedatectl status" >&2
     fi
@@ -828,12 +828,12 @@ ufw default allow outgoing
 # SSH in or the proxy stops working), so a failure here should stop the
 # script rather than be silently swallowed.
 if ! ufw allow "${SSH_PORT}"/tcp comment 'SSH'; then
-  echo "ERROR: Failed to add UFW rule for SSH port ${SSH_PORT}. Not enabling the firewall." >&2
+  err "Failed to add UFW rule for SSH port ${SSH_PORT}. Not enabling the firewall."
   echo "       Fix manually, then re-run: ufw allow ${SSH_PORT}/tcp && ufw --force enable" >&2
   exit 1
 fi
 if ! ufw allow "${LISTEN_PORT}"/tcp comment 'Xray REALITY'; then
-  echo "ERROR: Failed to add UFW rule for Xray port ${LISTEN_PORT}. Not enabling the firewall." >&2
+  err "Failed to add UFW rule for Xray port ${LISTEN_PORT}. Not enabling the firewall."
   exit 1
 fi
 
@@ -841,7 +841,7 @@ ufw --force enable
 ufw reload
 
 if ! ufw status | grep -q "Status: active"; then
-  echo "ERROR: UFW did not report active after enabling. The firewall may not be" >&2
+  err "UFW did not report active after enabling. The firewall may not be"
   echo "       protecting this server. Check: ufw status verbose" >&2
   exit 1
 fi
@@ -859,7 +859,7 @@ systemctl enable fail2ban
 systemctl restart fail2ban
 sleep 1
 if ! systemctl is-active --quiet fail2ban; then
-  echo "WARNING: fail2ban did not come up after restart. SSH brute-force protection" >&2
+  warn "fail2ban did not come up after restart. SSH brute-force protection"
   echo "         is NOT active. Check: journalctl -u fail2ban -e" >&2
 fi
 
@@ -893,7 +893,7 @@ sysctl --system >/dev/null
 
 ACTIVE_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
 if [[ "$ACTIVE_CC" != "bbr" ]]; then
-  echo "WARNING: Requested BBR but the kernel reports '${ACTIVE_CC}' as active." >&2
+  warn "Requested BBR but the kernel reports '${ACTIVE_CC}' as active."
   echo "         Likely cause: the tcp_bbr kernel module isn't available on this kernel." >&2
   echo "         Check: modprobe tcp_bbr && sysctl net.ipv4.tcp_congestion_control=bbr" >&2
   echo "         Not fatal -- proxy still works, just without BBR's throughput benefit." >&2
@@ -951,11 +951,6 @@ systemctl enable --now daily-reboot.timer
 # Copies the content (not a symlink), so it keeps working even if the
 # original downloaded copy is moved or deleted.
 #
-# Install a short-name copy so this script can be run as 'reality' from
-# anywhere, instead of needing to remember/find the original file path.
-# Copies the content (not a symlink), so it keeps working even if the
-# original downloaded copy is moved or deleted.
-#
 # If $0 isn't a real file (e.g. run via `bash <(curl -Ls ...)`, where $0
 # points to a process-substitution pipe, not a regular file), fall back
 # to re-downloading the script fresh from SCRIPT_SOURCE_URL instead.
@@ -980,7 +975,7 @@ else
     chmod +x "$REALITY_SHORTCUT"
   else
     rm -f "$REALITY_SHORTCUT_TMP"
-    echo "WARNING: Could not install the 'reality' shortcut (this run wasn't from a" >&2
+    warn "Could not install the 'reality' shortcut (this run wasn't from a"
     echo "         real file on disk, e.g. 'bash <(curl ...)', and re-downloading" >&2
     echo "         from ${SCRIPT_SOURCE_URL} also failed or returned an incomplete file)." >&2
     echo "         Everything else succeeded -- to add the shortcut manually:" >&2
