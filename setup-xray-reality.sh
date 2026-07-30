@@ -397,6 +397,16 @@ EOF
     fi
   fi
 
+  # Only back up if this is actually going to change something. Any real
+  # credential/SNI/port difference necessarily shows up in config.json, so
+  # comparing content here reliably detects "did anything meaningful
+  # change" -- without this, a completely no-op re-run (e.g. plain
+  # 'reality' with nothing to update) was creating a new backup every
+  # single time, burning through the 15-backup retention window fast.
+  if [[ -f "$CONFIG_FILE" ]] && ! cmp -s "$tmp_config" "$CONFIG_FILE"; then
+    backup_current_state
+  fi
+
   # Atomic swap: rename is a single filesystem operation, so a crash here
   # never leaves a half-written config.json -- you get the old one or the
   # fully-written new one, never something in between.
@@ -734,8 +744,6 @@ if [[ -z "$UUID" ]] && [[ -t 0 ]]; then
   done
   echo "Using: ${C_CYAN}${SNI_DOMAIN}${C_RESET}"
 fi
-
-backup_current_state
 
 step "1/9" "Preparing server (updates, cleanup, essential tools)"
 export DEBIAN_FRONTEND=noninteractive
