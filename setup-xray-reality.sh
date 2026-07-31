@@ -407,7 +407,15 @@ EOF
   # change" -- without this, a completely no-op re-run (e.g. plain
   # 'reality' with nothing to update) was creating a new backup every
   # single time, burning through the 15-backup retention window fast.
-  if [[ -f "$CONFIG_FILE" ]] && ! cmp -s "$tmp_config" "$CONFIG_FILE"; then
+  #
+  # CONFIG_CHANGED (global, read by callers) lets install mode also skip
+  # an unnecessary restart on a genuine no-op run -- see the final restart
+  # check at the end of install mode, which also independently checks
+  # whether the xray-core binary itself was updated.
+  if [[ -f "$CONFIG_FILE" ]] && cmp -s "$tmp_config" "$CONFIG_FILE"; then
+    CONFIG_CHANGED=0
+  else
+    CONFIG_CHANGED=1
     backup_current_state
   fi
 
@@ -735,20 +743,28 @@ fi
 # to fix it. Silently skipped if $0 isn't a real file (e.g. piped via
 # process substitution -- that path already always re-downloads fresh) or
 # if GitHub isn't reachable within a few seconds.
+#
+# Runs in the background so its network round-trip overlaps with the SNI
+# prompt (waiting on you) and step 1's apt operations below, instead of
+# adding its own few seconds serially before anything else starts. The
+# result is collected further down, once there's been time for it to finish.
 SELF_UPDATE_CHECK_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
+SELF_UPDATE_RESULT_FILE=$(mktemp)
+SELF_UPDATE_BG_PID=""
 if [[ -f "$SELF_UPDATE_CHECK_PATH" ]]; then
-  REMOTE_SCRIPT_TMP=$(mktemp)
-  if curl -fsSL --connect-timeout 5 --max-time 10 "$SCRIPT_SOURCE_URL" -o "$REMOTE_SCRIPT_TMP" 2>/dev/null \
-     && bash -n "$REMOTE_SCRIPT_TMP" 2>/dev/null; then
-    LOCAL_HASH=$(sha256sum "$SELF_UPDATE_CHECK_PATH" 2>/dev/null | awk '{print $1}')
-    REMOTE_HASH=$(sha256sum "$REMOTE_SCRIPT_TMP" 2>/dev/null | awk '{print $1}')
-    if [[ -n "$LOCAL_HASH" && -n "$REMOTE_HASH" && "$LOCAL_HASH" != "$REMOTE_HASH" ]]; then
-      warn "This copy of the script is out of date (differs from ${SCRIPT_SOURCE_URL})."
-      echo "         Update with: bash <(curl -Ls ${SCRIPT_SOURCE_URL})" >&2
-      echo "         Continuing with the current (older) copy for this run." >&2
+  (
+    REMOTE_SCRIPT_TMP=$(mktemp)
+    if curl -fsSL --connect-timeout 5 --max-time 10 "$SCRIPT_SOURCE_URL" -o "$REMOTE_SCRIPT_TMP" 2>/dev/null \
+       && bash -n "$REMOTE_SCRIPT_TMP" 2>/dev/null; then
+      LOCAL_HASH=$(sha256sum "$SELF_UPDATE_CHECK_PATH" 2>/dev/null | awk '{print $1}')
+      REMOTE_HASH=$(sha256sum "$REMOTE_SCRIPT_TMP" 2>/dev/null | awk '{print $1}')
+      if [[ -n "$LOCAL_HASH" && -n "$REMOTE_HASH" && "$LOCAL_HASH" != "$REMOTE_HASH" ]]; then
+        echo "outdated" > "$SELF_UPDATE_RESULT_FILE"
+      fi
     fi
-  fi
-  rm -f "$REMOTE_SCRIPT_TMP"
+    rm -f "$REMOTE_SCRIPT_TMP"
+  ) &
+  SELF_UPDATE_BG_PID=$!
 fi
 
 # Only prompt for a custom SNI on a genuinely first-time install (no UUID
@@ -808,14 +824,18 @@ apt-get autoremove -y --purge
 apt-get autoclean -y
 
 # Packages this script actually depends on -- install must succeed.
-apt-get install -y \
+# --no-install-recommends skips recommended-but-unused extras (docs,
+# fonts, etc.) that several of these commonly pull in by default on a
+# headless VPS that doesn't need them -- a real, if modest, bandwidth
+# and install-time saving on every run that needs to install anything here.
+apt-get install -y --no-install-recommends \
   curl wget unzip jq openssl qrencode ufw fail2ban ca-certificates
 
 # "Nice to have" base tools some environments are missing by default.
 # Not required by anything below, so a missing package here (package
 # names/availability vary across Debian/Ubuntu versions and minimal
 # cloud images) should warn, not abort the whole install.
-apt-get install -y gnupg lsb-release apt-transport-https logrotate || \
+apt-get install -y --no-install-recommends gnupg lsb-release apt-transport-https logrotate || \
   echo "NOTE: one or more optional packages (gnupg/lsb-release/apt-transport-https/logrotate) were unavailable; continuing anyway, they aren't required."
 
 if [[ -f /var/run/reboot-required ]]; then
@@ -824,21 +844,58 @@ if [[ -f /var/run/reboot-required ]]; then
   echo "      or reboot manually now with: reboot"
 fi
 
-step "2/9" "Installing Xray-core (official installer)"
-XRAY_INSTALL_ATTEMPTS=3
-for attempt in $(seq 1 "$XRAY_INSTALL_ATTEMPTS"); do
-  if bash -c "$(curl -fsSL --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)" @ install; then
-    break
+# Collect the backgrounded self-update check (started before the SNI
+# prompt) now that step 1's apt operations have given it plenty of time
+# to finish -- its network round-trip overlapped with real work above
+# instead of adding its own delay serially before anything started.
+if [[ -n "$SELF_UPDATE_BG_PID" ]]; then
+  wait "$SELF_UPDATE_BG_PID" 2>/dev/null || true
+  if [[ -s "$SELF_UPDATE_RESULT_FILE" ]]; then
+    warn "This copy of the script is out of date (differs from ${SCRIPT_SOURCE_URL})."
+    echo "         Update with: bash <(curl -Ls ${SCRIPT_SOURCE_URL})" >&2
+    echo "         Continuing with the current (older) copy for this run." >&2
   fi
-  if [[ "$attempt" -eq "$XRAY_INSTALL_ATTEMPTS" ]]; then
-    err "Failed to install Xray-core after ${XRAY_INSTALL_ATTEMPTS} attempts (likely a network issue reaching GitHub)."
-    exit 1
-  fi
-  echo "Xray-core install attempt ${attempt} failed, retrying in 5s..."
-  sleep 5
-done
+fi
+rm -f "$SELF_UPDATE_RESULT_FILE"
 
+step "2/9" "Installing Xray-core (official installer)"
 mkdir -p "$XRAY_CONFIG_DIR"
+BEFORE_XRAY_VERSION=$(xray version 2>/dev/null | head -n1 || echo "none")
+
+# The official installer always makes a full network round-trip to check
+# the latest release, even when almost certainly already current. Skip
+# that full check if we already have xray installed and checked within
+# the last 24h -- falls back to the full check on first install, or once
+# the cache goes stale, so this can't silently skip updates forever.
+XRAY_UPDATE_CHECK_CACHE="${XRAY_CONFIG_DIR}/.last-xray-checkupdate"
+SKIP_INSTALLER_CHECK=0
+if command -v xray >/dev/null 2>&1 && [[ -f "$XRAY_UPDATE_CHECK_CACHE" ]]; then
+  LAST_CHECK=$(cat "$XRAY_UPDATE_CHECK_CACHE" 2>/dev/null || echo 0)
+  NOW=$(date +%s)
+  if [[ "$LAST_CHECK" =~ ^[0-9]+$ ]] && [[ $((NOW - LAST_CHECK)) -lt 86400 ]]; then
+    SKIP_INSTALLER_CHECK=1
+  fi
+fi
+
+if [[ "$SKIP_INSTALLER_CHECK" -eq 1 ]]; then
+  ok "Xray-core was checked for updates within the last 24h -- skipping the full check this run."
+else
+  XRAY_INSTALL_ATTEMPTS=3
+  for attempt in $(seq 1 "$XRAY_INSTALL_ATTEMPTS"); do
+    if bash -c "$(curl -fsSL --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)" @ install; then
+      break
+    fi
+    if [[ "$attempt" -eq "$XRAY_INSTALL_ATTEMPTS" ]]; then
+      err "Failed to install Xray-core after ${XRAY_INSTALL_ATTEMPTS} attempts (likely a network issue reaching GitHub)."
+      exit 1
+    fi
+    echo "Xray-core install attempt ${attempt} failed, retrying in 5s..."
+    sleep 5
+  done
+  date +%s > "$XRAY_UPDATE_CHECK_CACHE"
+fi
+
+AFTER_XRAY_VERSION=$(xray version 2>/dev/null | head -n1 || echo "none")
 
 step "3/9" "Setting up credentials (UUID, REALITY keypair, short ID)"
 if [[ -n "$UUID" && -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" && -n "$SHORT_ID" ]]; then
@@ -1031,6 +1088,16 @@ net.ipv6.conf.default.accept_source_route = 0
 # Restrict ptrace to direct child processes only -- blunts a class of
 # local privilege escalation via one process attaching a debugger to another
 kernel.yama.ptrace_scope = 1
+
+# Throughput/latency tuning for a proxy carrying real traffic
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.core.somaxconn = 4096
+net.ipv4.tcp_max_syn_backlog = 4096
 EOF
 sysctl --system >/dev/null
 
@@ -1143,5 +1210,11 @@ echo "  ${C_CYAN}reality --rotate-uuid${C_RESET}   -> revoke current client link
 echo "  ${C_CYAN}reality --rotate-all${C_RESET}    -> full credential reset (invalidates everything)"
 echo "  ${C_CYAN}reality --show${C_RESET}          -> reprint current client link + QR"
 
-step "final" "Restarting Xray with final configuration"
-restart_and_verify
+step "final" "Restarting Xray"
+SERVICE_CURRENTLY_ACTIVE=$(systemctl is-active --quiet "${SERVICE_NAME}" && echo 1 || echo 0)
+if [[ "$CONFIG_CHANGED" == "0" ]] && [[ "$BEFORE_XRAY_VERSION" == "$AFTER_XRAY_VERSION" ]] && [[ "$SERVICE_CURRENTLY_ACTIVE" == "1" ]]; then
+  ok "Nothing changed (config identical, Xray-core unchanged, service already running) -- skipping restart."
+  verify_handshake
+else
+  restart_and_verify
+fi
