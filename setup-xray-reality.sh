@@ -41,6 +41,8 @@
 #
 set -euo pipefail
 
+SCRIPT_START_TIME=$(date +%s)
+
 # ---------------------------------------------------------------------------
 # Terminal output helpers (auto-disabled when not a real terminal, e.g.
 # piped to a log file, or when NO_COLOR is set -- so output stays clean
@@ -62,14 +64,76 @@ banner() {
   echo ""
 }
 
+# Small icon per step, matched by keyword in the description -- purely
+# cosmetic, falls through to a generic bullet for anything unmatched.
+step_icon() {
+  case "$1" in
+    *"Preparing server"*)     echo "📦" ;;
+    *"Xray-core"*)            echo "⬇️ " ;;
+    *"credentials"*)          echo "🔑" ;;
+    *"Writing Xray config"*)  echo "⚙️ " ;;
+    *"systemd service"*)      echo "🛠️ " ;;
+    *"firewall"*)             echo "🛡️ " ;;
+    *"fail2ban"*)             echo "🚫" ;;
+    *"BBR"*)                  echo "⚡" ;;
+    *"reboot"*)               echo "🔄" ;;
+    *"Restarting"*)           echo "🔁" ;;
+    *"Rotating"*)             echo "🔃" ;;
+    *"Restoring"*)            echo "♻️ " ;;
+    *"backup"*|*"Scanning"*)  echo "🗂️ " ;;
+    *)                        echo "▪" ;;
+  esac
+}
+
+# Renders a filled/empty block progress bar for "n/total"-style labels.
+# Falls through to no bar for non-numeric labels (e.g. "final", "restore").
+# Builds the bar via string concatenation rather than `tr` -- `tr`
+# corrupts multi-byte UTF-8 characters when running in a non-UTF-8 locale
+# (confirmed: many minimal Debian/Ubuntu cloud images default to C/POSIX,
+# not UTF-8), so this avoids that failure mode entirely.
+progress_bar() {
+  local label="$1" width=20
+  if [[ "$label" =~ ^([0-9]+)/([0-9]+)$ ]]; then
+    local current="${BASH_REMATCH[1]}" total="${BASH_REMATCH[2]}"
+    local filled=$((width * current / total))
+    local empty=$((width - filled))
+    local bar="" i
+    for ((i = 0; i < filled; i++)); do bar+="█"; done
+    for ((i = 0; i < empty; i++)); do bar+="░"; done
+    echo "$bar"
+  fi
+}
+
 step() {
+  local label="$1" desc="$2" icon bar
+  icon=$(step_icon "$desc")
+  bar=$(progress_bar "$label")
   echo ""
-  echo "${C_BLUE}${C_BOLD}==> [$1]${C_RESET} ${C_BOLD}$2${C_RESET}"
+  if [[ -n "$bar" ]]; then
+    echo "${C_BLUE}${C_BOLD}==> [$label]${C_RESET} ${C_CYAN}${bar}${C_RESET} ${icon} ${C_BOLD}${desc}${C_RESET}"
+  else
+    echo "${C_BLUE}${C_BOLD}==> [$label]${C_RESET} ${icon} ${C_BOLD}${desc}${C_RESET}"
+  fi
 }
 
 ok()   { echo "${C_GREEN}  ✓ $1${C_RESET}"; }
 warn() { echo "${C_YELLOW}  ⚠ WARNING:${C_RESET} $1" >&2; }
 err()  { echo "${C_RED}  ✗ ERROR:${C_RESET} $1" >&2; }
+
+# Human-readable elapsed time since SCRIPT_START_TIME (set at the very top
+# of the script), used in the final completion summary.
+elapsed_time() {
+  local now elapsed mins secs
+  now=$(date +%s)
+  elapsed=$((now - SCRIPT_START_TIME))
+  mins=$((elapsed / 60))
+  secs=$((elapsed % 60))
+  if [[ "$mins" -gt 0 ]]; then
+    echo "${mins}m ${secs}s"
+  else
+    echo "${secs}s"
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # Configuration (edit if needed, or override via environment variables)
@@ -1218,3 +1282,6 @@ if [[ "$CONFIG_CHANGED" == "0" ]] && [[ "$BEFORE_XRAY_VERSION" == "$AFTER_XRAY_V
 else
   restart_and_verify
 fi
+
+echo ""
+echo "${C_CYAN}Done in $(elapsed_time).${C_RESET}"
