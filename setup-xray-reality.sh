@@ -65,10 +65,15 @@ step() {
   local label="$1" desc="$2" icon bar
   icon=$(step_icon "$desc")
   bar=$(progress_bar "$label")
+  
   echo ""
   if [[ -n "$bar" ]]; then
-    echo "${C_BLUE}${C_BOLD}==> [$label]${C_RESET} ${C_CYAN}${bar}${C_RESET} ${icon} ${C_BOLD}${desc}${C_RESET}"
+    # Store the formatted bar globally for the live spinner line
+    CURRENT_PROGRESS_BAR="${C_CYAN}${bar}${C_RESET} "
+    echo "${C_BLUE}${C_BOLD}==> [$label]${C_RESET} ${CURRENT_PROGRESS_BAR}${icon} ${C_BOLD}${desc}${C_RESET}"
   else
+    # Clear it for steps that don't have a numeric progress label (e.g., "final")
+    CURRENT_PROGRESS_BAR=""
     echo "${C_BLUE}${C_BOLD}==> [$label]${C_RESET} ${icon} ${C_BOLD}${desc}${C_RESET}"
   fi
 }
@@ -91,6 +96,8 @@ elapsed_time() {
 }
 
 SPINNER_FRAMES=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+# Global variable to hold the current step's progress bar state for the spinner
+CURRENT_PROGRESS_BAR=""
 
 run_spinner() {
   local desc="$1"; shift
@@ -105,7 +112,8 @@ run_spinner() {
     local i=0 frame
     while kill -0 "$pid" 2>/dev/null; do
       frame="${SPINNER_FRAMES[i % ${#SPINNER_FRAMES[@]}]}"
-      printf "\r${C_CYAN}%s${C_RESET} %s..." "$frame" "$desc"
+      # Inject the live progress bar into the carriage return (\r) loop
+      printf "\r  %s${C_CYAN}%s${C_RESET} %s..." "$CURRENT_PROGRESS_BAR" "$frame" "$desc"
       i=$((i + 1))
       sleep 0.1
     done
