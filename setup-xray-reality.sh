@@ -91,63 +91,11 @@ step_icon() {
 # corrupts multi-byte UTF-8 characters when running in a non-UTF-8 locale
 # (confirmed: many minimal Debian/Ubuntu cloud images default to C/POSIX,
 # not UTF-8), so this avoids that failure mode entirely.
-progress_bar() {
-  local label="$1" width=20
-  if [[ "$label" =~ ^([0-9]+)/([0-9]+)$ ]]; then
-    local current="${BASH_REMATCH[1]}" total="${BASH_REMATCH[2]}"
-    local filled=$((width * current / total))
-    local empty=$((width - filled))
-    local bar="" i
-    for ((i = 0; i < filled; i++)); do bar+="█"; done
-    for ((i = 0; i < empty; i++)); do bar+="░"; done
-    echo "$bar"
-  fi
-}
-
-# Live variant used while a spinner is actually running: same filled/empty
-# split as progress_bar, but with one cell replaced by a brighter "pulse"
-# character whose position sweeps back and forth across the bar each
-# frame -- ping-pong pattern (0..width-1..0), verified separately before
-# wiring in. Gives genuine motion since we have no real sub-step progress
-# to report, rather than a static bar sitting next to a spinning glyph.
-progress_bar_pulse() {
-  local label="$1" frame_i="$2" width=20
-  if [[ "$label" =~ ^([0-9]+)/([0-9]+)$ ]]; then
-    local current="${BASH_REMATCH[1]}" total="${BASH_REMATCH[2]}"
-    local filled=$((width * current / total))
-    local cycle=$((2 * width - 2))
-    local pulse_pos=$((frame_i % cycle))
-    if [[ "$pulse_pos" -ge "$width" ]]; then
-      pulse_pos=$((cycle - pulse_pos))
-    fi
-    local bar="" i ch
-    for ((i = 0; i < width; i++)); do
-      if [[ "$i" -eq "$pulse_pos" ]]; then
-        ch="▓"
-      elif [[ "$i" -lt "$filled" ]]; then
-        ch="█"
-      else
-        ch="░"
-      fi
-      bar+="$ch"
-    done
-    echo "$bar"
-  fi
-}
-
-CURRENT_STEP_LABEL=""
-
 step() {
-  local label="$1" desc="$2" icon bar
-  CURRENT_STEP_LABEL="$label"
+  local label="$1" desc="$2" icon
   icon=$(step_icon "$desc")
-  bar=$(progress_bar "$label")
   echo ""
-  if [[ -n "$bar" ]]; then
-    echo "${C_BLUE}${C_BOLD}==> [$label]${C_RESET} ${C_CYAN}${bar}${C_RESET} ${icon} ${C_BOLD}${desc}${C_RESET}"
-  else
-    echo "${C_BLUE}${C_BOLD}==> [$label]${C_RESET} ${icon} ${C_BOLD}${desc}${C_RESET}"
-  fi
+  echo "${C_BLUE}${C_BOLD}==> [$label]${C_RESET} ${icon} ${C_BOLD}${desc}${C_RESET}"
 }
 
 ok()   { echo "${C_GREEN}  ✓ $1${C_RESET}"; }
@@ -191,15 +139,10 @@ run_spinner() {
 
   if [[ -t 1 ]]; then
     tput civis 2>/dev/null || true
-    local i=0 frame bar
+    local i=0 frame
     while kill -0 "$pid" 2>/dev/null; do
       frame="${SPINNER_FRAMES[i % ${#SPINNER_FRAMES[@]}]}"
-      bar=$(progress_bar_pulse "$CURRENT_STEP_LABEL" "$i")
-      if [[ -n "$bar" ]]; then
-        printf "\r${C_CYAN}%s${C_RESET} %s %s..." "$bar" "$frame" "$desc"
-      else
-        printf "\r${C_CYAN}%s${C_RESET} %s..." "$frame" "$desc"
-      fi
+      printf "\r${C_CYAN}%s${C_RESET} %s..." "$frame" "$desc"
       i=$((i + 1))
       sleep 0.1
     done
@@ -1274,6 +1217,26 @@ if [[ "$ACTIVE_CC" != "bbr" ]]; then
   echo "         Likely cause: the tcp_bbr kernel module isn't available on this kernel." >&2
   echo "         Check: modprobe tcp_bbr && sysctl net.ipv4.tcp_congestion_control=bbr" >&2
   echo "         Not fatal -- proxy still works, just without BBR's throughput benefit." >&2
+fi
+
+# net.core.default_qdisc only governs qdisc assignment for interfaces that
+# come up AFTER this sysctl takes effect -- it does NOT retroactively
+# change the qdisc on an interface that was already up at boot, which is
+# always the case for the primary interface on a running VPS. BBR relies
+# on fq specifically for its internal pacing, so apply it live to the
+# actual interface rather than assuming the sysctl default covers it.
+PRIMARY_IFACE=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1)
+if [[ -n "$PRIMARY_IFACE" ]]; then
+  CURRENT_QDISC=$(tc qdisc show dev "$PRIMARY_IFACE" 2>/dev/null | awk '/root/ {print $2; exit}')
+  if [[ "$CURRENT_QDISC" != "fq" ]]; then
+    if tc qdisc replace dev "$PRIMARY_IFACE" root fq 2>/dev/null; then
+      ok "Applied fq qdisc live to ${PRIMARY_IFACE} (was: ${CURRENT_QDISC:-unknown})."
+    else
+      warn "Could not apply fq qdisc live to ${PRIMARY_IFACE} (was: ${CURRENT_QDISC:-unknown})."
+      echo "         BBR still works without it, just without full pacing benefit until next reboot" >&2
+      echo "         (the daily reboot timer will pick up the sysctl default at that point)." >&2
+    fi
+  fi
 fi
 
 # Cap the systemd journal's disk usage explicitly rather than trusting
