@@ -135,6 +135,68 @@ elapsed_time() {
   fi
 }
 
+# Array, not a single multi-byte string indexed by offset -- confirmed
+# earlier in this project that byte/char-offset string slicing corrupts
+# multi-byte UTF-8 in a non-UTF-8 (C/POSIX) locale. Array elements are
+# always safe since each is treated as an opaque whole string.
+SPINNER_FRAMES=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+
+# Runs a command in the background under an animated spinner, hiding its
+# normal (noisy) output. ALWAYS captures full output to a temp file and
+# ALWAYS prints it in full on failure -- nothing is ever silently
+# swallowed, only hidden when the command actually succeeds. Falls back
+# to a plain "running..." message with no animation when not a real
+# terminal (piped/logged output), but still hides-on-success there too.
+run_spinner() {
+  local desc="$1"; shift
+  local logfile
+  logfile=$(mktemp)
+
+  "$@" >"$logfile" 2>&1 &
+  local pid=$!
+
+  if [[ -t 1 ]]; then
+    tput civis 2>/dev/null || true
+    local i=0 frame
+    while kill -0 "$pid" 2>/dev/null; do
+      frame="${SPINNER_FRAMES[i % ${#SPINNER_FRAMES[@]}]}"
+      printf "\r${C_CYAN}%s${C_RESET} %s..." "$frame" "$desc"
+      i=$((i + 1))
+      sleep 0.1
+    done
+    tput cnorm 2>/dev/null || true
+  else
+    echo "Running: ${desc}..."
+  fi
+
+  # Never let set -e trip on `wait` itself -- we need to reach our own
+  # success/failure handling below regardless of the wrapped command's
+  # exit code, not have the script abort mid-function.
+  local rc=0
+  wait "$pid" || rc=$?
+
+  if [[ -t 1 ]]; then
+    printf "\r\033[K"
+  fi
+
+  if [[ "$rc" -eq 0 ]]; then
+    ok "$desc"
+  else
+    err "${desc} failed (exit ${rc}). Full output:"
+    sed 's/^/  /' "$logfile" >&2
+  fi
+
+  rm -f "$logfile"
+  return "$rc"
+}
+
+# Restore the cursor if the script is interrupted mid-spinner (Ctrl+C etc)
+# -- otherwise a hidden cursor can persist in the terminal after exit.
+# Guarded by -t 1 so this never leaks a stray escape sequence into piped
+# or redirected output (e.g. --help | less) on runs that never actually
+# touched the spinner.
+trap '[[ -t 1 ]] && tput cnorm 2>/dev/null; true' EXIT
+
 # ---------------------------------------------------------------------------
 # Configuration (edit if needed, or override via environment variables)
 # ---------------------------------------------------------------------------
@@ -882,25 +944,26 @@ fi
 
 step "1/9" "Preparing server (updates, cleanup, essential tools)"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get upgrade -y
-apt-get autoremove -y --purge
-apt-get autoclean -y
+run_spinner "Updating package lists" apt-get update -y
+run_spinner "Upgrading installed packages" apt-get upgrade -y
+run_spinner "Removing unused packages" apt-get autoremove -y --purge
+run_spinner "Cleaning apt cache" apt-get autoclean -y
 
 # Packages this script actually depends on -- install must succeed.
 # --no-install-recommends skips recommended-but-unused extras (docs,
 # fonts, etc.) that several of these commonly pull in by default on a
 # headless VPS that doesn't need them -- a real, if modest, bandwidth
 # and install-time saving on every run that needs to install anything here.
-apt-get install -y --no-install-recommends \
+run_spinner "Installing required packages" apt-get install -y --no-install-recommends \
   curl wget unzip jq openssl qrencode ufw fail2ban ca-certificates
 
 # "Nice to have" base tools some environments are missing by default.
 # Not required by anything below, so a missing package here (package
 # names/availability vary across Debian/Ubuntu versions and minimal
 # cloud images) should warn, not abort the whole install.
-apt-get install -y --no-install-recommends gnupg lsb-release apt-transport-https logrotate || \
+if ! run_spinner "Installing optional packages" apt-get install -y --no-install-recommends gnupg lsb-release apt-transport-https logrotate; then
   echo "NOTE: one or more optional packages (gnupg/lsb-release/apt-transport-https/logrotate) were unavailable; continuing anyway, they aren't required."
+fi
 
 if [[ -f /var/run/reboot-required ]]; then
   echo "NOTE: A previous update marked this system as needing a reboot."
@@ -946,14 +1009,15 @@ if [[ "$SKIP_INSTALLER_CHECK" -eq 1 ]]; then
 else
   XRAY_INSTALL_ATTEMPTS=3
   for attempt in $(seq 1 "$XRAY_INSTALL_ATTEMPTS"); do
-    if bash -c "$(curl -fsSL --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)" @ install; then
+    if run_spinner "Downloading and installing Xray-core (attempt ${attempt}/${XRAY_INSTALL_ATTEMPTS})" \
+         bash -c "$(curl -fsSL --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)" @ install; then
       break
     fi
     if [[ "$attempt" -eq "$XRAY_INSTALL_ATTEMPTS" ]]; then
       err "Failed to install Xray-core after ${XRAY_INSTALL_ATTEMPTS} attempts (likely a network issue reaching GitHub)."
       exit 1
     fi
-    echo "Xray-core install attempt ${attempt} failed, retrying in 5s..."
+    echo "Retrying in 5s..."
     sleep 5
   done
   date +%s > "$XRAY_UPDATE_CHECK_CACHE"
