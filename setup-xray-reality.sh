@@ -104,8 +104,42 @@ progress_bar() {
   fi
 }
 
+# Live variant used while a spinner is actually running: same filled/empty
+# split as progress_bar, but with one cell replaced by a brighter "pulse"
+# character whose position sweeps back and forth across the bar each
+# frame -- ping-pong pattern (0..width-1..0), verified separately before
+# wiring in. Gives genuine motion since we have no real sub-step progress
+# to report, rather than a static bar sitting next to a spinning glyph.
+progress_bar_pulse() {
+  local label="$1" frame_i="$2" width=20
+  if [[ "$label" =~ ^([0-9]+)/([0-9]+)$ ]]; then
+    local current="${BASH_REMATCH[1]}" total="${BASH_REMATCH[2]}"
+    local filled=$((width * current / total))
+    local cycle=$((2 * width - 2))
+    local pulse_pos=$((frame_i % cycle))
+    if [[ "$pulse_pos" -ge "$width" ]]; then
+      pulse_pos=$((cycle - pulse_pos))
+    fi
+    local bar="" i ch
+    for ((i = 0; i < width; i++)); do
+      if [[ "$i" -eq "$pulse_pos" ]]; then
+        ch="▓"
+      elif [[ "$i" -lt "$filled" ]]; then
+        ch="█"
+      else
+        ch="░"
+      fi
+      bar+="$ch"
+    done
+    echo "$bar"
+  fi
+}
+
+CURRENT_STEP_LABEL=""
+
 step() {
   local label="$1" desc="$2" icon bar
+  CURRENT_STEP_LABEL="$label"
   icon=$(step_icon "$desc")
   bar=$(progress_bar "$label")
   echo ""
@@ -157,10 +191,15 @@ run_spinner() {
 
   if [[ -t 1 ]]; then
     tput civis 2>/dev/null || true
-    local i=0 frame
+    local i=0 frame bar
     while kill -0 "$pid" 2>/dev/null; do
       frame="${SPINNER_FRAMES[i % ${#SPINNER_FRAMES[@]}]}"
-      printf "\r${C_CYAN}%s${C_RESET} %s..." "$frame" "$desc"
+      bar=$(progress_bar_pulse "$CURRENT_STEP_LABEL" "$i")
+      if [[ -n "$bar" ]]; then
+        printf "\r${C_CYAN}%s${C_RESET} %s %s..." "$bar" "$frame" "$desc"
+      else
+        printf "\r${C_CYAN}%s${C_RESET} %s..." "$frame" "$desc"
+      fi
       i=$((i + 1))
       sleep 0.1
     done
