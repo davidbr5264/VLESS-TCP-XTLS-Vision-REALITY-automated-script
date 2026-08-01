@@ -2,41 +2,78 @@
 #
 # setup-xray-reality.sh
 #
-# Fully automated installer & manager for a hardened Xray VLESS-TCP-XTLS-Vision-REALITY
-# server instance on Debian/Ubuntu VPS.
+# Automated installer / manager for a hardened Xray VLESS-TCP-XTLS-Vision-REALITY
+# instance on a Debian/Ubuntu VPS, for personal use.
+#
+# Usage:
+#   ./setup-xray-reality.sh                Install (or re-apply) full setup
+#   ./setup-xray-reality.sh --rotate-uuid  Replace UUID + short ID only
+#                                           (keeps REALITY keypair; use this to
+#                                           revoke a leaked client link without
+#                                           regenerating your server's identity)
+#   ./setup-xray-reality.sh --rotate-all   Replace UUID + short ID + REALITY
+#                                           keypair (invalidates ALL client links)
+#   ./setup-xray-reality.sh --show         Reprint the current client link/QR
+#                                           without changing anything
+#   ./setup-xray-reality.sh --list-backups List available backups with timestamps
+#   ./setup-xray-reality.sh --dedupe-backups Remove redundant backups where a
+#                                           consecutive run has identical config
+#                                           (keeps the most recent of each run)
+#   ./setup-xray-reality.sh --restore TS   Restore config/state from a backup
+#                                           (backs up current state first)
+#   ./setup-xray-reality.sh --help         Show this help
+#
+# What a full install does:
+#   1. Prepares the server: full apt update/upgrade, cleanup, essential tools
+#   2. Installs latest official Xray-core (XTLS/Xray-install)
+#   3. Generates UUID, REALITY x25519 keypair, and a short ID
+#   4. Writes a minimal-logging config.json (VLESS + TCP + XTLS-Vision + REALITY)
+#      camouflaged as a real site (default: i.ytimg.com)
+#   5. Locks the systemd unit down (NoNewPrivileges, ProtectSystem, etc.)
+#   6. Configures UFW (only SSH + Xray port open) and fail2ban for sshd
+#   7. Enables BBR + fq congestion control, applies basic sysctl hardening
+#   8. Schedules a daily reboot at midnight (server local time)
+#   9. Prints a ready-to-import vless:// link + QR code
+#
+# Re-running (install or any --rotate mode) automatically backs up the
+# previous config + client info under /root/xray-backups/<timestamp>/
+# before making changes, so nothing is silently lost.
 #
 set -euo pipefail
 
 SCRIPT_START_TIME=$(date +%s)
 
 # ---------------------------------------------------------------------------
-# Terminal Output & Formatting Toolkit
+# Terminal output helpers (auto-disabled when not a real terminal, e.g.
+# piped to a log file, or when NO_COLOR is set -- so output stays clean
+# either way rather than dumping raw escape codes into a logfile).
 # ---------------------------------------------------------------------------
 if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
-  C_RESET=$(tput sgr0); C_BOLD=$(tput bold); C_DIM=$(tput dim)
+  C_RESET=$(tput sgr0); C_BOLD=$(tput bold)
   C_RED=$(tput setaf 1); C_GREEN=$(tput setaf 2); C_YELLOW=$(tput setaf 3)
-  C_BLUE=$(tput setaf 4); C_MAGENTA=$(tput setaf 5); C_CYAN=$(tput setaf 6); C_WHITE=$(tput setaf 7)
+  C_BLUE=$(tput setaf 4); C_CYAN=$(tput setaf 6)
 else
-  C_RESET=""; C_BOLD=""; C_DIM=""
-  C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_MAGENTA=""; C_CYAN=""; C_WHITE=""
+  C_RESET=""; C_BOLD=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_CYAN=""
 fi
 
 banner() {
   echo ""
-  echo "${C_CYAN}  ╔══════════════════════════════════════════════════════════════╗${C_RESET}"
-  echo "${C_CYAN}  ║   ${C_BOLD}${C_WHITE}Xray VLESS · TCP · XTLS-Vision · REALITY Hardened Setup${C_RESET}${C_CYAN}   ║${C_RESET}"
-  echo "${C_CYAN}  ╚══════════════════════════════════════════════════════════════╝${C_RESET}"
+  echo "${C_CYAN}${C_BOLD}  ╔══════════════════════════════════════════════════════╗${C_RESET}"
+  echo "${C_CYAN}${C_BOLD}  ║    Xray VLESS · TCP · XTLS-Vision · REALITY Setup    ║${C_RESET}"
+  echo "${C_CYAN}${C_BOLD}  ╚══════════════════════════════════════════════════════╝${C_RESET}"
   echo ""
 }
 
+# Small icon per step, matched by keyword in the description -- purely
+# cosmetic, falls through to a generic bullet for anything unmatched.
 step_icon() {
   case "$1" in
     *"Preparing server"*)     echo "📦" ;;
     *"Xray-core"*)            echo "⬇️ " ;;
     *"credentials"*)          echo "🔑" ;;
     *"Writing Xray config"*)  echo "⚙️ " ;;
-    *"systemd service"*)      echo "🛡️ " ;;
-    *"firewall"*)             echo "🧱" ;;
+    *"systemd service"*)      echo "🛠️ " ;;
+    *"firewall"*)             echo "🛡️ " ;;
     *"fail2ban"*)             echo "🚫" ;;
     *"BBR"*)                  echo "⚡" ;;
     *"reboot"*)               echo "🔄" ;;
@@ -48,8 +85,14 @@ step_icon() {
   esac
 }
 
+# Renders a filled/empty block progress bar for "n/total"-style labels.
+# Falls through to no bar for non-numeric labels (e.g. "final", "restore").
+# Builds the bar via string concatenation rather than `tr` -- `tr`
+# corrupts multi-byte UTF-8 characters when running in a non-UTF-8 locale
+# (confirmed: many minimal Debian/Ubuntu cloud images default to C/POSIX,
+# not UTF-8), so this avoids that failure mode entirely.
 progress_bar() {
-  local label="$1" width=22
+  local label="$1" width=20
   if [[ "$label" =~ ^([0-9]+)/([0-9]+)$ ]]; then
     local current="${BASH_REMATCH[1]}" total="${BASH_REMATCH[2]}"
     local filled=$((width * current / total))
@@ -65,15 +108,10 @@ step() {
   local label="$1" desc="$2" icon bar
   icon=$(step_icon "$desc")
   bar=$(progress_bar "$label")
-  
   echo ""
   if [[ -n "$bar" ]]; then
-    # Store the formatted bar globally for the live spinner line
-    CURRENT_PROGRESS_BAR="${C_CYAN}${bar}${C_RESET} "
-    echo "${C_BLUE}${C_BOLD}==> [$label]${C_RESET} ${CURRENT_PROGRESS_BAR}${icon} ${C_BOLD}${desc}${C_RESET}"
+    echo "${C_BLUE}${C_BOLD}==> [$label]${C_RESET} ${C_CYAN}${bar}${C_RESET} ${icon} ${C_BOLD}${desc}${C_RESET}"
   else
-    # Clear it for steps that don't have a numeric progress label (e.g., "final")
-    CURRENT_PROGRESS_BAR=""
     echo "${C_BLUE}${C_BOLD}==> [$label]${C_RESET} ${icon} ${C_BOLD}${desc}${C_RESET}"
   fi
 }
@@ -82,6 +120,8 @@ ok()   { echo "${C_GREEN}  ✓ $1${C_RESET}"; }
 warn() { echo "${C_YELLOW}  ⚠ WARNING:${C_RESET} $1" >&2; }
 err()  { echo "${C_RED}  ✗ ERROR:${C_RESET} $1" >&2; }
 
+# Human-readable elapsed time since SCRIPT_START_TIME (set at the very top
+# of the script), used in the final completion summary.
 elapsed_time() {
   local now elapsed mins secs
   now=$(date +%s)
@@ -95,10 +135,18 @@ elapsed_time() {
   fi
 }
 
+# Array, not a single multi-byte string indexed by offset -- confirmed
+# earlier in this project that byte/char-offset string slicing corrupts
+# multi-byte UTF-8 in a non-UTF-8 (C/POSIX) locale. Array elements are
+# always safe since each is treated as an opaque whole string.
 SPINNER_FRAMES=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
-# Global variable to hold the current step's progress bar state for the spinner
-CURRENT_PROGRESS_BAR=""
 
+# Runs a command in the background under an animated spinner, hiding its
+# normal (noisy) output. ALWAYS captures full output to a temp file and
+# ALWAYS prints it in full on failure -- nothing is ever silently
+# swallowed, only hidden when the command actually succeeds. Falls back
+# to a plain "running..." message with no animation when not a real
+# terminal (piped/logged output), but still hides-on-success there too.
 run_spinner() {
   local desc="$1"; shift
   local logfile
@@ -112,8 +160,7 @@ run_spinner() {
     local i=0 frame
     while kill -0 "$pid" 2>/dev/null; do
       frame="${SPINNER_FRAMES[i % ${#SPINNER_FRAMES[@]}]}"
-      # Inject the live progress bar into the carriage return (\r) loop
-      printf "\r  %s${C_CYAN}%s${C_RESET} %s..." "$CURRENT_PROGRESS_BAR" "$frame" "$desc"
+      printf "\r${C_CYAN}%s${C_RESET} %s..." "$frame" "$desc"
       i=$((i + 1))
       sleep 0.1
     done
@@ -122,6 +169,9 @@ run_spinner() {
     echo "Running: ${desc}..."
   fi
 
+  # Never let set -e trip on `wait` itself -- we need to reach our own
+  # success/failure handling below regardless of the wrapped command's
+  # exit code, not have the script abort mid-function.
   local rc=0
   wait "$pid" || rc=$?
 
@@ -132,25 +182,34 @@ run_spinner() {
   if [[ "$rc" -eq 0 ]]; then
     ok "$desc"
   else
-    err "${desc} failed (exit ${rc}). Output snippet:"
-    sed 's/^/  /' "$logfile" | tail -n 20 >&2
+    err "${desc} failed (exit ${rc}). Full output:"
+    sed 's/^/  /' "$logfile" >&2
   fi
 
   rm -f "$logfile"
   return "$rc"
 }
 
+# Restore the cursor if the script is interrupted mid-spinner (Ctrl+C etc)
+# -- otherwise a hidden cursor can persist in the terminal after exit.
+# Guarded by -t 1 so this never leaks a stray escape sequence into piped
+# or redirected output (e.g. --help | less) on runs that never actually
+# touched the spinner.
 trap '[[ -t 1 ]] && tput cnorm 2>/dev/null; true' EXIT
 
 # ---------------------------------------------------------------------------
-# Configuration Defaults & Environmental Variables
+# Configuration (edit if needed, or override via environment variables)
 # ---------------------------------------------------------------------------
-SNI_DOMAIN_DEFAULT="${SNI_DOMAIN:-i.ytimg.com}"
-LISTEN_PORT_DEFAULT="${LISTEN_PORT:-443}"
+SNI_DOMAIN_DEFAULT="${SNI_DOMAIN:-i.ytimg.com}"   # REALITY camouflage target
+LISTEN_PORT_DEFAULT="${LISTEN_PORT:-443}"         # Xray listen port
+# Used as a fallback to install the 'reality' shortcut when this script is
+# run via a process substitution / pipe (e.g. `bash <(curl -Ls ...)`),
+# where $0 doesn't point to an actual file on disk. Override via env var
+# if you're running a fork of this script from a different location.
 SCRIPT_SOURCE_URL="${SCRIPT_SOURCE_URL:-https://raw.githubusercontent.com/davidbr5264/VLESS-TCP-XTLS-Vision-REALITY-automated-script/master/setup-xray-reality.sh}"
 XRAY_CONFIG_DIR="/usr/local/etc/xray"
 CONFIG_FILE="${XRAY_CONFIG_DIR}/config.json"
-STATE_FILE="${XRAY_CONFIG_DIR}/.reality-state"
+STATE_FILE="${XRAY_CONFIG_DIR}/.reality-state"    # remembers settings between runs
 CLIENT_INFO_FILE="/root/xray-client-info.txt"
 BACKUP_ROOT="/root/xray-backups"
 SERVICE_NAME="xray"
@@ -167,17 +226,17 @@ case "${1:-}" in
     MODE="restore"
     RESTORE_TS="${2:-}"
     if [[ -z "$RESTORE_TS" ]]; then
-      err "--restore requires a timestamp parameter. Use --list-backups to view timestamps."
+      err "--restore requires a timestamp. See --list-backups for available ones."
       exit 1
     fi
     ;;
   --help|-h)
-    sed -n '2,30p' "$0"
+    sed -n '2,41p' "$0"
     exit 0
     ;;
   "") ;;
   *)
-    err "Unknown argument '$1'. Use --help for usage details."
+    err "Unknown argument '$1'. Use --help for usage."
     exit 1
     ;;
 esac
@@ -185,51 +244,65 @@ esac
 banner
 
 # ---------------------------------------------------------------------------
-# Preflight Verification
+# Preflight checks
 # ---------------------------------------------------------------------------
 if [[ $EUID -ne 0 ]]; then
-  err "This script requires superuser privileges. Please execute using sudo or as root."
+  err "This script must be run as root (use sudo)."
   exit 1
 fi
 
+# Prevent two concurrent runs (e.g. accidentally launched in two terminals)
+# from racing on the same config/backup/state files. Held for the life of
+# this process; released automatically on exit, including on error.
 LOCK_FILE="/var/lock/reality-setup.lock"
 exec 200>"$LOCK_FILE"
 if ! flock -n 200; then
-  err "Another operation is currently using lockfile: ${LOCK_FILE}."
+  err "Another run of this script appears to be in progress (lock: ${LOCK_FILE})."
+  echo "       Wait for it to finish, or remove the lock file if you're sure nothing" >&2
+  echo "       is actually running: rm -f ${LOCK_FILE}" >&2
   exit 1
 fi
 
 if [[ "$MODE" != "install" ]] && ! command -v xray >/dev/null 2>&1; then
-  err "Xray installation not found. Run standard installation mode first."
+  err "Xray is not installed yet. Run the script with no arguments first."
   exit 1
 fi
 
+# Non-install modes (rotate/show/restore) rely on jq, openssl, and
+# qrencode, but only ever checked that xray itself exists. If any of
+# these went missing after the initial install, the failure should be a
+# clear message here, not a bare "command not found" partway through.
 if [[ "$MODE" != "install" ]]; then
   for dep in jq openssl qrencode; do
     if ! command -v "$dep" >/dev/null 2>&1; then
-      err "Missing required dependency: '${dep}'."
-      echo "       Install it using: apt-get install -y ${dep}" >&2
+      err "Required tool '${dep}' is missing (it should have been installed already)."
+      echo "       Reinstall it with: apt-get install -y ${dep}" >&2
       exit 1
     fi
   done
 fi
 
 if [[ "$MODE" == "install" ]] && ! command -v apt-get >/dev/null 2>&1; then
-  err "Unsupported OS. This automated script requires Debian or Ubuntu."
+  err "This script only supports Debian/Ubuntu (apt-based) systems."
   exit 1
 fi
 
+# Fail with a clear message rather than a confusing mid-script error if
+# there's not enough room for apt upgrades, Xray-core, and logs/backups.
 if [[ "$MODE" == "install" ]]; then
   AVAILABLE_KB=$(df --output=avail / 2>/dev/null | tail -n1 | tr -d ' ')
   MIN_REQUIRED_KB=1048576  # 1GB
   if [[ -n "$AVAILABLE_KB" ]] && [[ "$AVAILABLE_KB" -lt "$MIN_REQUIRED_KB" ]]; then
-    err "Insufficient disk space on / ($((AVAILABLE_KB / 1024))MB available, 1024MB required)."
+    err "Less than 1GB free on / (found $((AVAILABLE_KB / 1024))MB)."
+    echo "       apt upgrades, Xray-core, and logs need headroom to install safely." >&2
+    echo "       Free up space first (e.g. 'apt autoremove --purge -y'), then re-run." >&2
     exit 1
   fi
 fi
 
 # ---------------------------------------------------------------------------
-# Load Existing State
+# Load any previously saved state (SNI/port/keys), so rotate/show modes
+# reuse the same settings instead of falling back to defaults.
 # ---------------------------------------------------------------------------
 SNI_DOMAIN="$SNI_DOMAIN_DEFAULT"
 LISTEN_PORT="$LISTEN_PORT_DEFAULT"
@@ -240,25 +313,35 @@ SHORT_ID=""
 SSH_PORT=""
 
 if [[ -f "$STATE_FILE" ]]; then
+  # Existing state always wins over env var defaults, on purpose -- this is
+  # what makes plain re-runs preserve credentials instead of regenerating
+  # them. But that means SNI_DOMAIN=/LISTEN_PORT=... env vars silently do
+  # nothing on an existing install, which is confusing without a message.
+  # There's currently no supported way to change just the SNI or port
+  # without a full --rotate-all (which also regenerates the keypair).
   # shellcheck disable=SC1090
   source "$STATE_FILE"
+
   if [[ "$SNI_DOMAIN_DEFAULT" != "i.ytimg.com" && "$SNI_DOMAIN_DEFAULT" != "$SNI_DOMAIN" ]]; then
-    warn "SNI_DOMAIN override ignored; existing deployment state '${SNI_DOMAIN}' takes precedence."
+    warn "SNI_DOMAIN env var ('${SNI_DOMAIN_DEFAULT}') was set, but an existing install already"
+    echo "         uses '${SNI_DOMAIN}' -- existing state always wins, so the env var was ignored." >&2
+    echo "         There's no way to change just the SNI without --rotate-all (full reset)." >&2
   fi
   if [[ "$LISTEN_PORT_DEFAULT" != "443" && "$LISTEN_PORT_DEFAULT" != "$LISTEN_PORT" ]]; then
-    warn "LISTEN_PORT override ignored; existing state port ${LISTEN_PORT} takes precedence."
+    warn "LISTEN_PORT env var ('${LISTEN_PORT_DEFAULT}') was set, but an existing install already"
+    echo "         uses port ${LISTEN_PORT} -- existing state always wins, so the env var was ignored." >&2
   fi
 fi
 
 if [[ "$MODE" == "show" ]]; then
   if [[ -z "$UUID" || -z "$PUBLIC_KEY" ]]; then
-    err "No previous state file found (${STATE_FILE}). Run full setup first."
+    err "No saved state found (${STATE_FILE}). Run a full install first."
     exit 1
   fi
 fi
 
 # ---------------------------------------------------------------------------
-# Helper Modules
+# Helper: back up current config + client info before any change
 # ---------------------------------------------------------------------------
 backup_current_state() {
   if [[ -f "$CONFIG_FILE" ]]; then
@@ -270,7 +353,10 @@ backup_current_state() {
     [[ -f "$CLIENT_INFO_FILE" ]] && cp -a "$CLIENT_INFO_FILE" "$backup_dir/client-info.txt" 2>/dev/null || true
     [[ -f "$STATE_FILE" ]] && cp -a "$STATE_FILE" "$backup_dir/state" 2>/dev/null || true
     chmod -R 600 "$backup_dir"/* 2>/dev/null || true
+    echo "Backed up previous config to: $backup_dir"
 
+    # Keep only the most recent 15 backups so this directory doesn't grow
+    # forever across years of periodic rotates/reinstalls.
     if [[ -d "$BACKUP_ROOT" ]]; then
       local backup_count
       backup_count=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d | wc -l)
@@ -281,28 +367,44 @@ backup_current_state() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Helper: generate UUID + short ID (used by install and --rotate-uuid)
+# ---------------------------------------------------------------------------
 generate_uuid_and_shortid() {
-  UUID=$(xray uuid) || { err "Failed executing 'xray uuid'."; exit 1; }
+  UUID=$(xray uuid) || { err "'xray uuid' command failed to run."; exit 1; }
   SHORT_ID=$(openssl rand -hex 8)
   if [[ -z "$UUID" || -z "$SHORT_ID" ]]; then
-    err "Generation of cryptographic tokens failed."
+    err "Failed to generate UUID or short ID."
     exit 1
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Helper: generate REALITY x25519 keypair (used by install and --rotate-all)
+# Handles both old and new `xray x25519` CLI output formats:
+#   Old: "Private key: xxx" / "Public key: xxx"
+#   New: "PrivateKey: xxx"  / "Password (PublicKey): xxx" / "Hash32: xxx"
+# ---------------------------------------------------------------------------
 generate_reality_keypair() {
   local key_output
-  key_output=$(xray x25519) || { err "Failed executing 'xray x25519'."; exit 1; }
+  key_output=$(xray x25519) || { err "'xray x25519' command failed to run."; exit 1; }
 
   PRIVATE_KEY=$(echo "$key_output" | grep -Ei '^[[:space:]]*(Private ?[Kk]ey)[[:space:]]*:' | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d ' \r' || true)
   PUBLIC_KEY=$(echo "$key_output" | grep -Ei '^[[:space:]]*(Public ?[Kk]ey|Password)([[:space:]]*\(.*\))?[[:space:]]*:' | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d ' \r' || true)
 
   if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-    err "Failed parsing REALITY keypairs."
+    err "Failed to parse REALITY keypair."
+    echo "  PRIVATE_KEY=${PRIVATE_KEY:-<empty>}" >&2
+    echo "  PUBLIC_KEY=${PUBLIC_KEY:-<empty>}" >&2
+    echo "  Raw 'xray x25519' output was:" >&2
+    echo "$key_output" >&2
     exit 1
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Helper: write config.json from current UUID/keys/short ID
+# ---------------------------------------------------------------------------
 write_config() {
   mkdir -p "$XRAY_CONFIG_DIR"
   local tmp_config
@@ -391,23 +493,51 @@ write_config() {
   }
 }
 EOF
-
+  # Fail fast with a clear message if the config we just wrote is malformed,
+  # rather than letting it surface later as an opaque "service failed to
+  # start" from systemd.
   if ! jq empty "$tmp_config" >/dev/null 2>&1; then
-    err "Draft JSON schema validation failed. Configuration aborted."
+    err "Generated config.json is not valid JSON. Not restarting xray."
+    echo "  Broken draft left at ${tmp_config} for inspection." >&2
+    echo "  Existing config (if any) at ${CONFIG_FILE} was left untouched." >&2
     exit 1
   fi
 
+  # jq only confirms valid JSON syntax -- it says nothing about whether
+  # Xray's own schema actually accepts the field names/structure. Xray-core
+  # has a real config-test mode built for exactly this; use it so a typo'd
+  # field surfaces here with a clear message, not as a cryptic runtime
+  # failure from systemd later.
+  #
+  # NOTE: the log directory must exist before this runs -- the config
+  # references /var/log/xray/error.log, and xray -test fails to even load
+  # the config if that path's parent directory doesn't exist yet (confirmed
+  # by testing against a real xray-core binary: this order bug would have
+  # broken every fresh install otherwise).
   mkdir -p /var/log/xray
   chown -R xray:xray /var/log/xray 2>/dev/null || true
 
   if command -v xray >/dev/null 2>&1; then
     if ! XRAY_TEST_OUTPUT=$(xray run -test -format json -config "$tmp_config" 2>&1); then
-      err "Xray core engine rejected the generated configuration:"
+      err "Xray rejected the generated config (schema/field error, not a JSON syntax error):"
       echo "$XRAY_TEST_OUTPUT" | sed 's/^/  /' >&2
+      echo "  Broken draft left at ${tmp_config} for inspection." >&2
+      echo "  Existing config (if any) at ${CONFIG_FILE} was left untouched." >&2
       exit 1
     fi
   fi
 
+  # Only back up if this is actually going to change something. Any real
+  # credential/SNI/port difference necessarily shows up in config.json, so
+  # comparing content here reliably detects "did anything meaningful
+  # change" -- without this, a completely no-op re-run (e.g. plain
+  # 'reality' with nothing to update) was creating a new backup every
+  # single time, burning through the 15-backup retention window fast.
+  #
+  # CONFIG_CHANGED (global, read by callers) lets install mode also skip
+  # an unnecessary restart on a genuine no-op run -- see the final restart
+  # check at the end of install mode, which also independently checks
+  # whether the xray-core binary itself was updated.
   if [[ -f "$CONFIG_FILE" ]] && cmp -s "$tmp_config" "$CONFIG_FILE"; then
     CONFIG_CHANGED=0
   else
@@ -415,11 +545,20 @@ EOF
     backup_current_state
   fi
 
+  # Atomic swap: rename is a single filesystem operation, so a crash here
+  # never leaves a half-written config.json -- you get the old one or the
+  # fully-written new one, never something in between.
   mv -f "$tmp_config" "$CONFIG_FILE"
+
+  # Config contains the REALITY private key -- restrict to root + the xray
+  # service user rather than leaving it world-readable.
   chown root:xray "$CONFIG_FILE" 2>/dev/null || true
   chmod 640 "$CONFIG_FILE" 2>/dev/null || true
 }
 
+# ---------------------------------------------------------------------------
+# Helper: save state so future rotate/show runs remember settings
+# ---------------------------------------------------------------------------
 save_state() {
   local tmp_state
   tmp_state=$(mktemp "${XRAY_CONFIG_DIR}/.reality-state.XXXXXX")
@@ -436,43 +575,62 @@ EOF
   mv -f "$tmp_state" "$STATE_FILE"
 }
 
+# ---------------------------------------------------------------------------
+# Helper: restart xray and confirm it came up healthy
+# ---------------------------------------------------------------------------
 restart_and_verify() {
   systemctl daemon-reload
   systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
   systemctl restart "${SERVICE_NAME}"
   sleep 1
   if ! systemctl is-active --quiet "${SERVICE_NAME}"; then
-    err "Xray service failed to enter active state. Debug logs: journalctl -u xray -e"
+    err "xray service failed to start. Check: journalctl -u xray -e"
     exit 1
   fi
-  ok "Xray systemd service is active and running."
+  ok "xray service is active"
   verify_handshake
 }
 
+# ---------------------------------------------------------------------------
+# Helper: best-effort network-level check that Xray is actually serving
+# REALITY correctly, not just that the process is running. "Active" in
+# systemd only means the process didn't crash -- it says nothing about
+# whether the port is reachable or the TLS handshake actually works.
+# Non-fatal: prints warnings rather than aborting, since this check can
+# have environmental false negatives (e.g. loopback quirks) that a real
+# remote client wouldn't hit.
+# ---------------------------------------------------------------------------
 verify_handshake() {
   local port="${LISTEN_PORT:-443}"
   local sni="${SNI_DOMAIN:-}"
 
   if ! ss -tln 2>/dev/null | grep -q ":${port} "; then
-    warn "No process actively listening on target port ${port}."
+    warn "Xray is active, but nothing appears to be listening on port ${port}."
+    echo "         Check: ss -tlnp | grep ${port}" >&2
     return 0
   fi
 
   if ! timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/${port}" 2>/dev/null; then
-    warn "Local TCP loopback connection attempt failed on port ${port}."
+    warn "Port ${port} is listed as listening, but a local TCP connect failed."
     return 0
   fi
 
   if [[ -n "$sni" ]] && command -v openssl >/dev/null 2>&1; then
     if ! timeout 5 bash -c "echo | openssl s_client -connect 127.0.0.1:${port} -servername '${sni}' 2>/dev/null" | grep -q "CONNECTED"; then
-      warn "TLS handshake check returned non-zero response (Check journalctl if clients fail)."
+      warn "TCP connects, but a TLS handshake against 127.0.0.1:${port} (SNI: ${sni})"
+      echo "         didn't complete cleanly. This can be a loopback/self-connect quirk --" >&2
+      echo "         test from a real client before assuming something's wrong. If a real" >&2
+      echo "         client also fails, check: journalctl -u xray -e" >&2
       return 0
     fi
   fi
 
-  ok "Active verification successful: Port open, TCP connection verified, TLS handshake completed."
+  ok "Handshake check passed: port listening, TCP connects, TLS handshake completes."
 }
 
+# ---------------------------------------------------------------------------
+# Helper: build vless:// link, write client info file, print summary + QR
+# ---------------------------------------------------------------------------
 output_client_info() {
   local server_ip
   server_ip=$(curl -fsSL -4 --max-time 5 https://ifconfig.me 2>/dev/null || \
@@ -482,7 +640,9 @@ output_client_info() {
   server_ip=$(echo "$server_ip" | tr -d '[:space:]')
 
   if [[ -z "$server_ip" ]]; then
-    warn "Unable to detect public IP address automatically."
+    warn "Could not determine the server's public IP (all lookup services unreachable)."
+    echo "         Everything else succeeded -- find your IP manually (e.g. 'curl ifconfig.me' or" >&2
+    echo "         your VPS provider's dashboard) and substitute it into the link below." >&2
     server_ip="YOUR_SERVER_IP"
   fi
 
@@ -497,13 +657,14 @@ Flow          : xtls-rprx-vision
 Security      : reality
 SNI (dest)    : ${SNI_DOMAIN}
 Public Key    : ${PUBLIC_KEY}
-Private Key   : ${PRIVATE_KEY}   (server-side confidential)
+Private Key   : ${PRIVATE_KEY}   (server-side only, keep secret)
 Short ID      : ${SHORT_ID}
 Fingerprint   : chrome
 
-Client Import Link:
+Client import link:
 ${vless_link}
 ========================================================================
+Keep this file secret. It contains your private key.
 EOF
   chmod 600 "$CLIENT_INFO_FILE"
 
@@ -512,35 +673,36 @@ EOF
   if [[ "$status_now" == "active" ]]; then status_color="$C_GREEN"; else status_color="$C_YELLOW"; fi
 
   echo ""
-  echo "${C_CYAN}┌──────────────────────────────────────────────────────────────┐${C_RESET}"
-  echo "${C_CYAN}│${C_RESET} ${C_BOLD}Deployment Summary${C_RESET}"
-  echo "${C_CYAN}├──────────────────────────────────────────────────────────────┤${C_RESET}"
-  echo "${C_CYAN}│${C_RESET}  Service Status : ${status_color}${status_now}${C_RESET}"
-  echo "${C_CYAN}│${C_RESET}  Configuration  : ${C_WHITE}${CONFIG_FILE}${C_RESET}"
-  echo "${C_CYAN}│${C_RESET}  Credentials    : ${C_WHITE}${CLIENT_INFO_FILE}${C_RESET}"
-  echo "${C_CYAN}└──────────────────────────────────────────────────────────────┘${C_RESET}"
+  echo "${C_CYAN}############################################################${C_RESET}"
+  echo "  Service status : ${status_color}${status_now}${C_RESET}"
+  echo "  Config file    : ${CONFIG_FILE}"
+  echo "  Client info    : ${CLIENT_INFO_FILE} (chmod 600)"
+  echo "${C_CYAN}############################################################${C_RESET}"
   echo ""
-  echo "${C_BOLD}Client Import Connection Link:${C_RESET}"
+  echo "${C_BOLD}Client link${C_RESET} (import into v2rayN / NekoBox / Shadowrocket / etc.):"
   echo "${C_GREEN}${vless_link}${C_RESET}"
   echo ""
-  echo "${C_BOLD}QR Code:${C_RESET}"
+  echo "${C_BOLD}QR code:${C_RESET}"
   qrencode -t ansiutf8 "${vless_link}"
 }
 
 # ---------------------------------------------------------------------------
-# Auxiliary Modes
+# MODE: --show  (read-only, no changes)
 # ---------------------------------------------------------------------------
 if [[ "$MODE" == "show" ]]; then
   output_client_info
   exit 0
 fi
 
+# ---------------------------------------------------------------------------
+# MODE: --list-backups  (read-only, no changes)
+# ---------------------------------------------------------------------------
 if [[ "$MODE" == "list-backups" ]]; then
   if [[ ! -d "$BACKUP_ROOT" ]] || [[ -z "$(ls -A "$BACKUP_ROOT" 2>/dev/null)" ]]; then
-    echo "No backups located in ${BACKUP_ROOT}."
+    echo "No backups found under ${BACKUP_ROOT}."
     exit 0
   fi
-  echo "Available configurations for restore (--restore <timestamp>):"
+  echo "Available backups (use with --restore <timestamp>):"
   for dir in "$BACKUP_ROOT"/*/; do
     ts=$(basename "$dir")
     contents=$(ls "$dir" 2>/dev/null | tr '\n' ' ')
@@ -549,13 +711,23 @@ if [[ "$MODE" == "list-backups" ]]; then
   exit 0
 fi
 
+# ---------------------------------------------------------------------------
+# MODE: --dedupe-backups  (remove redundant consecutive-duplicate backups)
+# ---------------------------------------------------------------------------
 if [[ "$MODE" == "dedupe-backups" ]]; then
   if [[ ! -d "$BACKUP_ROOT" ]] || [[ -z "$(ls -A "$BACKUP_ROOT" 2>/dev/null)" ]]; then
-    echo "No state backups located."
+    echo "No backups found under ${BACKUP_ROOT}."
     exit 0
   fi
 
-  step "dedupe" "Pruning redundant identical consecutive backups"
+  step "dedupe" "Scanning backups for redundant consecutive duplicates"
+
+  # Only collapses a *consecutive run* of identical config.json content
+  # (e.g. from repeated no-op 'reality' re-runs before the backup-skip fix)
+  # down to the most recent one in that run. Two backups with matching
+  # content that AREN'T consecutive -- meaning something changed and then
+  # changed back -- are left alone, since they represent genuinely
+  # different points in history that happen to coincide.
   mapfile -t ALL_BACKUPS < <(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d | sort)
 
   PREV_HASH=""
@@ -565,6 +737,7 @@ if [[ "$MODE" == "dedupe-backups" ]]; then
 
   for dir in "${ALL_BACKUPS[@]}"; do
     if [[ ! -f "${dir}/config.json" ]]; then
+      # No config.json to compare -- leave it alone, don't guess.
       PREV_HASH=""
       PREV_DIR=""
       continue
@@ -572,6 +745,10 @@ if [[ "$MODE" == "dedupe-backups" ]]; then
     CURRENT_HASH=$(sha256sum "${dir}/config.json" 2>/dev/null | awk '{print $1}')
 
     if [[ -n "$PREV_HASH" && "$CURRENT_HASH" == "$PREV_HASH" ]]; then
+      # This one matches the previous one in sequence -- the previous
+      # backup is now redundant (this one is strictly newer with the
+      # same content), so remove the previous one and keep this one as
+      # the new "most recent representative" of the run.
       rm -rf "$PREV_DIR"
       REMOVED_COUNT=$((REMOVED_COUNT + 1))
     else
@@ -581,32 +758,42 @@ if [[ "$MODE" == "dedupe-backups" ]]; then
     PREV_DIR="$dir"
   done
 
-  ok "Pruning complete. Removed: ${REMOVED_COUNT}, Retained: ${KEPT_COUNT}."
+  ok "Removed ${REMOVED_COUNT} redundant backup(s), kept ${KEPT_COUNT}."
   exit 0
 fi
 
+# ---------------------------------------------------------------------------
+# MODE: --restore <timestamp>  (restore config + state from a prior backup)
+# ---------------------------------------------------------------------------
 if [[ "$MODE" == "restore" ]]; then
   RESTORE_DIR="${BACKUP_ROOT}/${RESTORE_TS}"
   if [[ ! -d "$RESTORE_DIR" ]]; then
-    err "Specified backup non-existent: ${RESTORE_DIR}."
+    err "No backup found at ${RESTORE_DIR}."
+    echo "       Run --list-backups to see available timestamps." >&2
     exit 1
   fi
   if [[ ! -f "${RESTORE_DIR}/config.json" ]]; then
-    err "Missing config.json in backup target."
+    err "${RESTORE_DIR} doesn't contain a config.json -- can't restore from it."
     exit 1
   fi
 
-  step "restore" "Restoring deployment state from: ${RESTORE_TS}"
+  step "restore" "Restoring from backup: ${RESTORE_TS}"
+  # Back up the current (about-to-be-overwritten) state too, so restoring
+  # is itself undoable.
   backup_current_state
 
   if ! jq empty "${RESTORE_DIR}/config.json" >/dev/null 2>&1; then
-    err "Target configuration invalid JSON. Restoration aborted."
+    err "Backed-up config.json at ${RESTORE_DIR} is not valid JSON. Not restoring."
     exit 1
   fi
 
+  # Same schema-level check write_config uses -- jq only confirms JSON
+  # syntax, not that Xray's own schema still accepts this backup (e.g. if
+  # it predates a field rename). Format must be specified explicitly since
+  # this path doesn't end in .json.
   if command -v xray >/dev/null 2>&1; then
     if ! RESTORE_TEST_OUTPUT=$(xray run -test -format json -config "${RESTORE_DIR}/config.json" 2>&1); then
-      err "Target configuration failed core schema checks:"
+      err "Backed-up config.json at ${RESTORE_DIR} fails Xray's own schema check. Not restoring:"
       echo "$RESTORE_TEST_OUTPUT" | sed 's/^/  /' >&2
       exit 1
     fi
@@ -620,14 +807,17 @@ if [[ "$MODE" == "restore" ]]; then
 
   restart_and_verify
   echo ""
-  echo "Successfully restored system state from ${RESTORE_TS}."
+  echo "Restored from ${RESTORE_TS}. Run --show to reprint the restored client link."
   exit 0
 fi
 
+# ---------------------------------------------------------------------------
+# MODE: --rotate-uuid  (new UUID + short ID; keeps REALITY keypair)
+# ---------------------------------------------------------------------------
 if [[ "$MODE" == "rotate-uuid" ]]; then
-  step "rotate-uuid" "Rotating client UUID & short ID (Keypair preserved)"
+  step "rotate-uuid" "Rotating UUID + short ID (REALITY keypair unchanged)"
   if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-    err "Missing REALITY keypair. Complete baseline installation first."
+    err "No existing REALITY keypair found in state. Run a full install first."
     exit 1
   fi
   backup_current_state
@@ -636,20 +826,25 @@ if [[ "$MODE" == "rotate-uuid" ]]; then
   save_state
   output_client_info
   restart_and_verify
+  echo ""
+  echo "Old client link is now invalid. Any device using it must import the new link above."
   exit 0
 fi
 
+# ---------------------------------------------------------------------------
+# MODE: --rotate-all  (new UUID + short ID + REALITY keypair)
+# ---------------------------------------------------------------------------
 if [[ "$MODE" == "rotate-all" ]]; then
   if [[ -t 0 ]]; then
     echo ""
-    warn "This action invalidates ALL active client links permanently."
-    read -r -p "Type 'yes' to proceed: " CONFIRM_ROTATE_ALL
+    warn "This invalidates EVERY existing client link. Not undoable except by --restore."
+    read -r -p "Type 'yes' to continue: " CONFIRM_ROTATE_ALL
     if [[ "$CONFIRM_ROTATE_ALL" != "yes" ]]; then
-      echo "Rotation process canceled."
+      echo "Cancelled. No changes made."
       exit 0
     fi
   fi
-  step "rotate-all" "Rotating all operational credentials"
+  step "rotate-all" "Rotating ALL credentials (UUID, short ID, REALITY keypair)"
   backup_current_state
   generate_uuid_and_shortid
   generate_reality_keypair
@@ -657,12 +852,28 @@ if [[ "$MODE" == "rotate-all" ]]; then
   save_state
   output_client_info
   restart_and_verify
+  echo ""
+  echo "All previous client links are now permanently invalid."
   exit 0
 fi
 
 # ---------------------------------------------------------------------------
-# Main Installation Pipeline
+# MODE: install (default) — full setup, safe to re-run
 # ---------------------------------------------------------------------------
+
+# Best-effort check: is the copy of this script actually running (e.g. the
+# installed 'reality' shortcut) behind what's currently on GitHub? This is
+# a NOTIFICATION only -- it never replaces or modifies the running script
+# (self-modifying a script mid-execution is a real footgun: truncated
+# reads, races). It just tells you clearly if you're out of date and how
+# to fix it. Silently skipped if $0 isn't a real file (e.g. piped via
+# process substitution -- that path already always re-downloads fresh) or
+# if GitHub isn't reachable within a few seconds.
+#
+# Runs in the background so its network round-trip overlaps with the SNI
+# prompt (waiting on you) and step 1's apt operations below, instead of
+# adding its own few seconds serially before anything else starts. The
+# result is collected further down, once there's been time for it to finish.
 SELF_UPDATE_CHECK_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
 SELF_UPDATE_RESULT_FILE=$(mktemp)
 SELF_UPDATE_BG_PID=""
@@ -682,13 +893,22 @@ if [[ -f "$SELF_UPDATE_CHECK_PATH" ]]; then
   SELF_UPDATE_BG_PID=$!
 fi
 
+# Only prompt for a custom SNI on a genuinely first-time install (no UUID
+# yet means no existing state) and only when there's an actual interactive
+# terminal to prompt on -- piped/scripted/non-interactive runs just fall
+# through to the existing default (env var override, or i.ytimg.com).
 if [[ -z "$UUID" ]] && [[ -t 0 ]]; then
   while true; do
     echo ""
-    echo "${C_BOLD}REALITY Camouflage Target Domain (SNI)${C_RESET}"
-    echo "Enter a TLS 1.3 enabled target site (e.g., dl.google.com, swdist.apple.com)."
-    read -r -p "Target domain [${SNI_DOMAIN}]: " SNI_INPUT
+    echo "${C_BOLD}REALITY camouflage target (SNI)${C_RESET}"
+    echo "This is the real site Xray impersonates during the TLS handshake."
+    echo "It should be a real TLS1.3 site, not a huge one (avoid google.com/"
+    echo "microsoft.com-scale sites -- large certs can trip protocol issues,"
+    echo "and CDN-fronted domains make REALITY easier to fingerprint)."
+    read -r -p "Domain to use [${SNI_DOMAIN}]: " SNI_INPUT
     if [[ -n "$SNI_INPUT" ]]; then
+      # Basic sanitization in case someone pastes a full URL by mistake:
+      # strip scheme, path, port, and trailing slashes -- keep just the host.
       SNI_INPUT="${SNI_INPUT#http://}"
       SNI_INPUT="${SNI_INPUT#https://}"
       SNI_INPUT="${SNI_INPUT%%/*}"
@@ -698,51 +918,82 @@ if [[ -z "$UUID" ]] && [[ -t 0 ]]; then
       fi
     fi
 
+    # Best-effort live check: does this domain actually resolve and serve
+    # TLS1.3 on 443? openssl may not be installed yet this early (that
+    # happens in step 1 below) -- skip the check gracefully if so, rather
+    # than block on a tool that isn't there yet.
     if command -v openssl >/dev/null 2>&1; then
       if timeout 6 openssl s_client -connect "${SNI_DOMAIN}:443" -servername "${SNI_DOMAIN}" -tls1_3 </dev/null >/dev/null 2>&1; then
-        ok "Verified: ${SNI_DOMAIN} responds on port 443 with TLS 1.3 support."
+        ok "Confirmed: ${SNI_DOMAIN} resolves and serves TLS1.3 on port 443."
         break
       else
-        warn "Could not verify TLS 1.3 support on ${SNI_DOMAIN}:443."
-        read -r -p "Use this domain regardless? (y/N): " SNI_FORCE
+        warn "Couldn't confirm ${SNI_DOMAIN} serves TLS1.3 on port 443 (DNS failure, no"
+        echo "         response, or TLS1.3 unsupported). REALITY requires this to work." >&2
+        read -r -p "Use it anyway? (y/N): " SNI_FORCE
         if [[ "$SNI_FORCE" =~ ^[Yy]$ ]]; then
           break
         fi
+        # loop back and re-prompt
       fi
     else
       break
     fi
   done
-  echo "Target SNI set to: ${C_CYAN}${SNI_DOMAIN}${C_RESET}"
+  echo "Using: ${C_CYAN}${SNI_DOMAIN}${C_RESET}"
 fi
 
-step "1/9" "Preparing server (updates, packages & hardening)"
+step "1/9" "Preparing server (updates, cleanup, essential tools)"
 export DEBIAN_FRONTEND=noninteractive
-run_spinner "Updating apt repositories" apt-get update -y
-run_spinner "Upgrading package dependencies" apt-get upgrade -y
-run_spinner "Removing unneeded packages" apt-get autoremove -y --purge
-run_spinner "Cleaning apt local cache" apt-get autoclean -y
+run_spinner "Updating package lists" apt-get update -y
+run_spinner "Upgrading installed packages" apt-get upgrade -y
+run_spinner "Removing unused packages" apt-get autoremove -y --purge
+run_spinner "Cleaning apt cache" apt-get autoclean -y
 
-run_spinner "Installing core system utilities" apt-get install -y --no-install-recommends \
+# Packages this script actually depends on -- install must succeed.
+# --no-install-recommends skips recommended-but-unused extras (docs,
+# fonts, etc.) that several of these commonly pull in by default on a
+# headless VPS that doesn't need them -- a real, if modest, bandwidth
+# and install-time saving on every run that needs to install anything here.
+run_spinner "Installing required packages" apt-get install -y --no-install-recommends \
   curl wget unzip jq openssl qrencode ufw fail2ban ca-certificates
 
-if ! run_spinner "Installing supplemental libraries" apt-get install -y --no-install-recommends gnupg lsb-release apt-transport-https logrotate; then
-  echo "Notice: Non-critical supplemental packages skipped."
+# "Nice to have" base tools some environments are missing by default.
+# Not required by anything below, so a missing package here (package
+# names/availability vary across Debian/Ubuntu versions and minimal
+# cloud images) should warn, not abort the whole install.
+if ! run_spinner "Installing optional packages" apt-get install -y --no-install-recommends gnupg lsb-release apt-transport-https logrotate; then
+  echo "NOTE: one or more optional packages (gnupg/lsb-release/apt-transport-https/logrotate) were unavailable; continuing anyway, they aren't required."
 fi
 
+if [[ -f /var/run/reboot-required ]]; then
+  echo "NOTE: A previous update marked this system as needing a reboot."
+  echo "      The daily reboot timer set up later in this script will handle it,"
+  echo "      or reboot manually now with: reboot"
+fi
+
+# Collect the backgrounded self-update check (started before the SNI
+# prompt) now that step 1's apt operations have given it plenty of time
+# to finish -- its network round-trip overlapped with real work above
+# instead of adding its own delay serially before anything started.
 if [[ -n "$SELF_UPDATE_BG_PID" ]]; then
   wait "$SELF_UPDATE_BG_PID" 2>/dev/null || true
   if [[ -s "$SELF_UPDATE_RESULT_FILE" ]]; then
-    warn "A newer revision of this script is available online."
-    echo "         Update using: bash <(curl -Ls ${SCRIPT_SOURCE_URL})" >&2
+    warn "This copy of the script is out of date (differs from ${SCRIPT_SOURCE_URL})."
+    echo "         Update with: bash <(curl -Ls ${SCRIPT_SOURCE_URL})" >&2
+    echo "         Continuing with the current (older) copy for this run." >&2
   fi
 fi
 rm -f "$SELF_UPDATE_RESULT_FILE"
 
-step "2/9" "Installing Xray-core engine & GeoData"
+step "2/9" "Installing Xray-core (official installer)"
 mkdir -p "$XRAY_CONFIG_DIR"
 BEFORE_XRAY_VERSION=$(xray version 2>/dev/null | head -n1 || echo "none")
 
+# The official installer always makes a full network round-trip to check
+# the latest release, even when almost certainly already current. Skip
+# that full check if we already have xray installed and checked within
+# the last 24h -- falls back to the full check on first install, or once
+# the cache goes stale, so this can't silently skip updates forever.
 XRAY_UPDATE_CHECK_CACHE="${XRAY_CONFIG_DIR}/.last-xray-checkupdate"
 SKIP_INSTALLER_CHECK=0
 if command -v xray >/dev/null 2>&1 && [[ -f "$XRAY_UPDATE_CHECK_CACHE" ]]; then
@@ -754,18 +1005,19 @@ if command -v xray >/dev/null 2>&1 && [[ -f "$XRAY_UPDATE_CHECK_CACHE" ]]; then
 fi
 
 if [[ "$SKIP_INSTALLER_CHECK" -eq 1 ]]; then
-  ok "Xray-core check skipped (last checked within 24 hours)."
+  ok "Xray-core was checked for updates within the last 24h -- skipping the full check this run."
 else
   XRAY_INSTALL_ATTEMPTS=3
   for attempt in $(seq 1 "$XRAY_INSTALL_ATTEMPTS"); do
-    if run_spinner "Fetching latest Xray binary (attempt ${attempt}/${XRAY_INSTALL_ATTEMPTS})" \
+    if run_spinner "Downloading and installing Xray-core (attempt ${attempt}/${XRAY_INSTALL_ATTEMPTS})" \
          bash -c "$(curl -fsSL --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)" @ install; then
       break
     fi
     if [[ "$attempt" -eq "$XRAY_INSTALL_ATTEMPTS" ]]; then
-      err "Xray-core installation failed after ${XRAY_INSTALL_ATTEMPTS} attempts."
+      err "Failed to install Xray-core after ${XRAY_INSTALL_ATTEMPTS} attempts (likely a network issue reaching GitHub)."
       exit 1
     fi
+    echo "Retrying in 5s..."
     sleep 5
   done
   date +%s > "$XRAY_UPDATE_CHECK_CACHE"
@@ -773,30 +1025,39 @@ fi
 
 AFTER_XRAY_VERSION=$(xray version 2>/dev/null | head -n1 || echo "none")
 
-step "3/9" "Generating cryptographic parameters"
+step "3/9" "Setting up credentials (UUID, REALITY keypair, short ID)"
 if [[ -n "$UUID" && -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" && -n "$SHORT_ID" ]]; then
-  echo "Reusing saved operational keys from ${STATE_FILE}."
+  echo "Existing credentials found in ${STATE_FILE} -- reusing them (client links stay valid)."
+  echo "Need fresh credentials instead? Use --rotate-uuid or --rotate-all, not a plain re-run."
 else
-  echo "Generating fresh cryptographic tokens."
+  echo "No existing credentials found -- generating new ones (first-time install)."
   generate_uuid_and_shortid
   generate_reality_keypair
 fi
 
+# Dedicated unprivileged system account for the xray service to run as
+# (see step 5 below). Created here, before write_config, so the config
+# file's ownership can be set correctly on first install.
 if ! id -u xray >/dev/null 2>&1; then
   useradd --system --no-create-home --shell /usr/sbin/nologin xray
 fi
 
+# Catch a port conflict here with a clear message, rather than letting it
+# surface later as a generic "service failed to start". A listener that IS
+# our own xray (e.g. a re-run on an already-running instance) is expected
+# and fine; anything else bound to this port is a real conflict.
 PORT_HOLDER=$(ss -tlnp 2>/dev/null | awk -v p=":${LISTEN_PORT}\$" '$4 ~ p {print}')
 if [[ -n "$PORT_HOLDER" ]] && ! echo "$PORT_HOLDER" | grep -qi "xray"; then
-  err "Port ${LISTEN_PORT} is currently occupied by an external application:"
+  err "Port ${LISTEN_PORT} is already in use by something other than Xray:"
   echo "$PORT_HOLDER" | sed 's/^/  /' >&2
+  echo "  Stop that service first, or choose a different port (LISTEN_PORT=... env var)." >&2
   exit 1
 fi
 
-step "4/9" "Generating hardened Xray configuration"
+step "4/9" "Writing Xray config (privacy-minded: no access logging)"
 write_config
 
-step "5/9" "Hardening systemd unit and service execution profile"
+step "5/9" "Hardening the systemd service"
 mkdir -p /etc/systemd/system/${SERVICE_NAME}.service.d
 cat > /etc/systemd/system/${SERVICE_NAME}.service.d/override.conf <<'EOF'
 [Unit]
@@ -825,52 +1086,95 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 EOF
 
+# OnFailure= above fires once the restart-attempt budget (StartLimitBurst)
+# is exhausted and the service gives up -- not on every individual
+# transient restart. This is local-only (broadcasts to logged-in terminals
+# + a critical syslog entry): there's no email/webhook configured anywhere
+# in this setup, so this can't reach you remotely, only if you're logged
+# into the box or checking logs.
 cat > /etc/systemd/system/xray-alert.service <<'EOF'
 [Unit]
-Description=Alert dispatcher for Xray service failures
+Description=Local alert when xray.service exhausts its restart attempts
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'logger -p daemon.crit "xray.service failed exhaustively."; wall "WARNING: xray.service failure." || true'
+ExecStart=/bin/sh -c 'logger -p daemon.crit "xray.service has FAILED and exhausted its restart attempts -- check: journalctl -u xray -e"; wall "WARNING: xray.service has failed and given up restarting. Check: journalctl -u xray -e" || true'
 EOF
 
+# Reload the unit + drop-in now so the change is registered, but hold off
+# on actually restarting until every other step below has succeeded --
+# see the single restart_and_verify call at the very end of install mode.
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
 
+# REALITY's handshake validation is timestamp-sensitive -- clock drift
+# causes intermittent, confusing failures. Confirm NTP sync is active
+# rather than assuming the base image has it enabled.
 if command -v timedatectl >/dev/null 2>&1; then
   if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" != "yes" ]]; then
     timedatectl set-ntp true >/dev/null 2>&1 || true
+    sleep 2
+    if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" != "yes" ]]; then
+      warn "System clock is not confirmed NTP-synchronized."
+      echo "         REALITY handshakes are timestamp-sensitive; clock drift can cause" >&2
+      echo "         intermittent failures. Check: timedatectl status" >&2
+    fi
   fi
 fi
 
 step "6/9" "Configuring firewall (UFW)"
-# Optimization: Fall back to active SSH connection socket details if parsing listener fails
 SSH_PORT=$(ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed 's/.*://' | head -n1)
-if [[ -z "$SSH_PORT" && -n "${SSH_CLIENT:-}" ]]; then
-  SSH_PORT=$(echo "$SSH_CLIENT" | awk '{print $3}')
-fi
 SSH_PORT="${SSH_PORT:-22}"
 
-if [[ -f /etc/default/ufw ]] && grep -qE '^IPV6=no' /etc/default/ufw; then
-  sed -i 's/^IPV6=no/IPV6=yes/' /etc/default/ufw
+# If SSH was ever reconfigured to a different port through some other means,
+# an old rule for the previous port could still be sitting here, open
+# forever. Detect and flag it -- but don't auto-delete: this script can't
+# tell a genuinely stale rule apart from an intentional second SSH listener,
+# and getting that wrong risks locking you out.
+STALE_SSH_RULES=$(ufw status numbered 2>/dev/null | grep "SSH" | grep -v "${SSH_PORT}/tcp" || true)
+if [[ -n "$STALE_SSH_RULES" ]]; then
+  echo "NOTE: Found UFW rule(s) tagged 'SSH' for a port other than the current one (${SSH_PORT}):"
+  echo "$STALE_SSH_RULES"
+  echo "      If SSH used to run on a different port, this is probably stale and safe to"
+  echo "      remove with: ufw delete <rule number>   (run 'ufw status numbered' to check)"
 fi
 
+# Make sure UFW actually enforces IPv6 too -- if IPV6=no here, the rules
+# below only apply to IPv4 and a public IPv6 address (common on many VPS
+# providers by default) would be left completely unfiltered.
+if [[ -f /etc/default/ufw ]] && grep -qE '^IPV6=no' /etc/default/ufw; then
+  sed -i 's/^IPV6=no/IPV6=yes/' /etc/default/ufw
+  echo "Enabled IPv6 support in UFW (was disabled; would have left IPv6 unfiltered)."
+fi
+
+# Pin the default policy explicitly rather than relying on whatever the
+# base image shipped with.
 ufw default deny incoming
 ufw default allow outgoing
 
+# These two rules are load-bearing (lose either one and you either can't
+# SSH in or the proxy stops working), so a failure here should stop the
+# script rather than be silently swallowed.
 if ! ufw allow "${SSH_PORT}"/tcp comment 'SSH'; then
-  err "Failed allowing SSH port ${SSH_PORT} in UFW."
+  err "Failed to add UFW rule for SSH port ${SSH_PORT}. Not enabling the firewall."
+  echo "       Fix manually, then re-run: ufw allow ${SSH_PORT}/tcp && ufw --force enable" >&2
   exit 1
 fi
 if ! ufw allow "${LISTEN_PORT}"/tcp comment 'Xray REALITY'; then
-  err "Failed allowing Xray port ${LISTEN_PORT} in UFW."
+  err "Failed to add UFW rule for Xray port ${LISTEN_PORT}. Not enabling the firewall."
   exit 1
 fi
 
 ufw --force enable
 ufw reload
 
-step "7/9" "Configuring Fail2ban protection for SSH"
+if ! ufw status | grep -q "Status: active"; then
+  err "UFW did not report active after enabling. The firewall may not be"
+  echo "       protecting this server. Check: ufw status verbose" >&2
+  exit 1
+fi
+
+step "7/9" "Configuring fail2ban for SSH brute-force protection"
 cat > /etc/fail2ban/jail.d/sshd.local <<EOF
 [sshd]
 enabled = true
@@ -880,19 +1184,21 @@ bantime = 1h
 findtime = 10m
 EOF
 systemctl enable fail2ban
-systemctl restart fail2ban || warn "Fail2ban failed to restart."
+systemctl restart fail2ban
+sleep 1
+if ! systemctl is-active --quiet fail2ban; then
+  warn "fail2ban did not come up after restart. SSH brute-force protection"
+  echo "         is NOT active. Check: journalctl -u fail2ban -e" >&2
+fi
 
-step "8/9" "Applying BBR congestion control & kernel parameters"
-# Optimization: Explicitly load tcp_bbr module and make persistent
-modprobe tcp_bbr 2>/dev/null || true
-echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
-
+step "8/9" "Enabling BBR + basic kernel/network hardening"
 cat > /etc/sysctl.d/99-xray-hardening.conf <<'EOF'
 # Congestion control
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 
-# Security Hardening
+# Basic network hardening (.all applies to existing interfaces, .default
+# applies to interfaces that come up after this is set)
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.all.accept_source_route = 0
@@ -907,10 +1213,11 @@ net.ipv6.conf.all.accept_source_route = 0
 net.ipv6.conf.default.accept_redirects = 0
 net.ipv6.conf.default.accept_source_route = 0
 
-# Security: Ptrace restriction
+# Restrict ptrace to direct child processes only -- blunts a class of
+# local privilege escalation via one process attaching a debugger to another
 kernel.yama.ptrace_scope = 1
 
-# Performance optimization
+# Throughput/latency tuning for a proxy carrying real traffic
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_slow_start_after_idle = 0
 net.core.rmem_max = 16777216
@@ -920,8 +1227,18 @@ net.ipv4.tcp_wmem = 4096 65536 16777216
 net.core.somaxconn = 4096
 net.ipv4.tcp_max_syn_backlog = 4096
 EOF
-sysctl --system >/dev/null 2>&1 || true
+sysctl --system >/dev/null
 
+ACTIVE_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+if [[ "$ACTIVE_CC" != "bbr" ]]; then
+  warn "Requested BBR but the kernel reports '${ACTIVE_CC}' as active."
+  echo "         Likely cause: the tcp_bbr kernel module isn't available on this kernel." >&2
+  echo "         Check: modprobe tcp_bbr && sysctl net.ipv4.tcp_congestion_control=bbr" >&2
+  echo "         Not fatal -- proxy still works, just without BBR's throughput benefit." >&2
+fi
+
+# Cap the systemd journal's disk usage explicitly rather than trusting
+# whatever default the base image shipped with.
 mkdir -p /etc/systemd/journald.conf.d
 cat > /etc/systemd/journald.conf.d/99-xray-hardening.conf <<'EOF'
 [Journal]
@@ -929,6 +1246,7 @@ SystemMaxUse=200M
 EOF
 systemctl restart systemd-journald
 
+# Prevent /var/log/xray/error.log from growing unbounded on a long-lived box.
 cat > /etc/logrotate.d/xray <<'EOF'
 /var/log/xray/error.log {
   weekly
@@ -941,19 +1259,19 @@ cat > /etc/logrotate.d/xray <<'EOF'
 }
 EOF
 
-step "9/9" "Configuring scheduled system reboots"
+step "9/9" "Setting up daily reboot at midnight"
 cat > /etc/systemd/system/daily-reboot.service <<'EOF'
 [Unit]
-Description=Daily Maintenance Reboot
+Description=Daily scheduled reboot
 
 [Service]
 Type=oneshot
-ExecStart=/sbin/shutdown -r now "Daily reboot"
+ExecStart=/sbin/shutdown -r now "Scheduled daily reboot"
 EOF
 
 cat > /etc/systemd/system/daily-reboot.timer <<'EOF'
 [Unit]
-Description=Daily Maintenance Reboot Timer
+Description=Daily reboot at midnight
 
 [Timer]
 OnCalendar=*-*-* 00:00:00
@@ -966,37 +1284,68 @@ EOF
 systemctl daemon-reload
 systemctl enable --now daily-reboot.timer
 
+# Install a short-name copy so this script can be run as 'reality' from
+# anywhere, instead of needing to remember/find the original file path.
+# Copies the content (not a symlink), so it keeps working even if the
+# original downloaded copy is moved or deleted.
+#
+# If $0 isn't a real file (e.g. run via `bash <(curl -Ls ...)`, where $0
+# points to a process-substitution pipe, not a regular file), fall back
+# to re-downloading the script fresh from SCRIPT_SOURCE_URL instead.
 REALITY_SHORTCUT="/usr/local/bin/reality"
 SELF_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
 REALITY_SHORTCUT_RESOLVED=$(readlink -f "$REALITY_SHORTCUT" 2>/dev/null || echo "$REALITY_SHORTCUT")
 
-if [[ "$SELF_PATH" != "$REALITY_SHORTCUT_RESOLVED" ]]; then
-  if [[ -f "$SELF_PATH" ]]; then
-    cp -f "$SELF_PATH" "$REALITY_SHORTCUT"
+if [[ "$SELF_PATH" == "$REALITY_SHORTCUT_RESOLVED" ]]; then
+  # Already running as the installed shortcut -- nothing to copy onto itself.
+  chmod +x "$REALITY_SHORTCUT" 2>/dev/null || true
+elif [[ -f "$SELF_PATH" ]]; then
+  cp -f "$SELF_PATH" "$REALITY_SHORTCUT"
+  chmod +x "$REALITY_SHORTCUT"
+else
+  REALITY_SHORTCUT_TMP=$(mktemp)
+  if curl -fsSL --connect-timeout 10 --max-time 30 "$SCRIPT_SOURCE_URL" -o "$REALITY_SHORTCUT_TMP" 2>/dev/null \
+     && bash -n "$REALITY_SHORTCUT_TMP" 2>/dev/null; then
+    # Only install it once we've confirmed the download is complete and
+    # syntactically valid -- a truncated/partial download would otherwise
+    # silently replace a working shortcut with a broken one.
+    mv -f "$REALITY_SHORTCUT_TMP" "$REALITY_SHORTCUT"
     chmod +x "$REALITY_SHORTCUT"
+  else
+    rm -f "$REALITY_SHORTCUT_TMP"
+    warn "Could not install the 'reality' shortcut (this run wasn't from a"
+    echo "         real file on disk, e.g. 'bash <(curl ...)', and re-downloading" >&2
+    echo "         from ${SCRIPT_SOURCE_URL} also failed or returned an incomplete file)." >&2
+    echo "         Everything else succeeded -- to add the shortcut manually:" >&2
+    echo "           curl -fsSL ${SCRIPT_SOURCE_URL} -o ${REALITY_SHORTCUT} && chmod +x ${REALITY_SHORTCUT}" >&2
   fi
 fi
 
+# Everything above (config, firewall, fail2ban, sysctl, reboot timer) is
+# now in place. Print the client link/QR and all summary info first, and
+# restart xray as the literal last action of the whole script.
 save_state
 output_client_info
 
 echo ""
-echo "${C_GREEN}${C_BOLD}✓ Deployment completed successfully.${C_RESET}"
+echo "${C_GREEN}${C_BOLD}✓ Setup complete.${C_RESET} Server will reboot daily at 00:00 (server local time)."
+echo "Check timezone with: timedatectl   (change with: timedatectl set-timezone <Region/City>)"
+echo "Cancel the daily reboot with: systemctl disable --now daily-reboot.timer"
 echo ""
-echo "${C_BOLD}Operational Commands:${C_RESET}"
-echo "  ${C_CYAN}reality${C_RESET}                 -> Run setup again (creates state backup)"
-echo "  ${C_CYAN}reality --rotate-uuid${C_RESET}   -> Revoke active client link"
-echo "  ${C_CYAN}reality --rotate-all${C_RESET}    -> Complete credentials reset"
-echo "  ${C_CYAN}reality --show${C_RESET}          -> Display client connection details"
+echo "${C_BOLD}Re-run any time${C_RESET} (works via either name, from any directory):"
+echo "  ${C_CYAN}reality${C_RESET}                 -> re-apply full setup (backs up old config first)"
+echo "  ${C_CYAN}reality --rotate-uuid${C_RESET}   -> revoke current client link, keep server identity"
+echo "  ${C_CYAN}reality --rotate-all${C_RESET}    -> full credential reset (invalidates everything)"
+echo "  ${C_CYAN}reality --show${C_RESET}          -> reprint current client link + QR"
 
-step "final" "Activating Xray service"
+step "final" "Restarting Xray"
 SERVICE_CURRENTLY_ACTIVE=$(systemctl is-active --quiet "${SERVICE_NAME}" && echo 1 || echo 0)
 if [[ "$CONFIG_CHANGED" == "0" ]] && [[ "$BEFORE_XRAY_VERSION" == "$AFTER_XRAY_VERSION" ]] && [[ "$SERVICE_CURRENTLY_ACTIVE" == "1" ]]; then
-  ok "No setup alterations detected. Service actively running."
+  ok "Nothing changed (config identical, Xray-core unchanged, service already running) -- skipping restart."
   verify_handshake
 else
   restart_and_verify
 fi
 
 echo ""
-echo "${C_CYAN}Execution completed in $(elapsed_time).${C_RESET}"
+echo "${C_CYAN}Done in $(elapsed_time).${C_RESET}"
