@@ -1174,6 +1174,19 @@ if ! systemctl is-active --quiet fail2ban; then
 fi
 
 step "8/9" "Enabling BBR + basic kernel/network hardening"
+
+# systemd-sysctl.service does NOT wait for or trigger on-demand kernel
+# module loading -- confirmed via the official sysctl.d(5) manpage. A
+# sysctl parameter that depends on a not-yet-loaded module (like
+# tcp_congestion_control=bbr depending on the tcp_bbr module, which is
+# built as a loadable module rather than compiled-in on most Debian/
+# Ubuntu kernels) can silently fail to apply on every boot -- including
+# our own daily reboot timer -- unless the module is loaded via
+# modules-load.d BEFORE sysctl settings are processed at boot.
+modprobe tcp_bbr 2>/dev/null || true
+mkdir -p /etc/modules-load.d
+echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
+
 cat > /etc/sysctl.d/99-xray-hardening.conf <<'EOF'
 # Congestion control
 net.core.default_qdisc = fq
