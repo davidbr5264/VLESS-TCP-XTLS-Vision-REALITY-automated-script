@@ -7,6 +7,9 @@ Automated installer for a hardened Xray REALITY proxy on a Debian/Ubuntu VPS. Pe
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/davidbr5264/vless-reality-automated-script/master/setup-xray-reality.sh)
 ```
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/davidbr5264/vless-reality-automated-script/master/setup-xray-reality-v2.sh)
+```
 
 Run as root. On a fresh install, you'll be prompted for a camouflage domain (SNI) with a sensible default — press Enter to accept it. Prints a `vless://` link + QR code when done.
 
