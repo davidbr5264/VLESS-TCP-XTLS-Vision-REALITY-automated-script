@@ -51,9 +51,9 @@ SCRIPT_START_TIME=$(date +%s)
 if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
   C_RESET=$(tput sgr0); C_BOLD=$(tput bold)
   C_RED=$(tput setaf 1); C_GREEN=$(tput setaf 2); C_YELLOW=$(tput setaf 3)
-  C_BLUE=$(tput setaf 4); C_CYAN=$(tput setaf 6)
+  C_BLUE=$(tput setaf 4); C_CYAN=$(tput setaf 6); C_MAGENTA=$(tput setaf 5)
 else
-  C_RESET=""; C_BOLD=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_CYAN=""
+  C_RESET=""; C_BOLD=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_CYAN=""; C_MAGENTA=""
 fi
 
 banner() {
@@ -122,6 +122,7 @@ elapsed_time() {
 # multi-byte UTF-8 in a non-UTF-8 (C/POSIX) locale. Array elements are
 # always safe since each is treated as an opaque whole string.
 SPINNER_FRAMES=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+SPINNER_COLORS=("$C_CYAN" "$C_BLUE" "$C_MAGENTA")
 
 # Runs a command in the background under an animated spinner, hiding its
 # normal (noisy) output. ALWAYS captures full output to a temp file and
@@ -139,10 +140,14 @@ run_spinner() {
 
   if [[ -t 1 ]]; then
     tput civis 2>/dev/null || true
-    local i=0 frame
+    local i=0 frame color start_time now elapsed
+    start_time=$(date +%s)
     while kill -0 "$pid" 2>/dev/null; do
       frame="${SPINNER_FRAMES[i % ${#SPINNER_FRAMES[@]}]}"
-      printf "\r${C_CYAN}%s${C_RESET} %s..." "$frame" "$desc"
+      color="${SPINNER_COLORS[i % ${#SPINNER_COLORS[@]}]}"
+      now=$(date +%s)
+      elapsed=$((now - start_time))
+      printf "\r${color}%s${C_RESET} %s... ${C_BOLD}(%ss)${C_RESET}" "$frame" "$desc" "$elapsed"
       i=$((i + 1))
       sleep 0.1
     done
