@@ -170,7 +170,16 @@ install_xray() {
   fi
 
   command -v xray >/dev/null 2>&1 || die "xray binary not found after installation."
-  XRAY_VERSION=$(xray version | head -n1)
+
+  # NOTE: deliberately not piping through `head` here. Under `set -o pipefail`,
+  # `xray version | head -n1` can make xray receive SIGPIPE when head closes
+  # the pipe early, which makes the pipeline report a non-zero exit status
+  # even though everything "worked" — and that silently kills the whole
+  # script under `set -e` with no error message. Capture full output first,
+  # then take the first line with a pure bash string operation instead.
+  local ver_full
+  ver_full=$(xray version 2>&1 || true)
+  XRAY_VERSION="${ver_full%%$'\n'*}"
   ok "Installed: ${XRAY_VERSION}"
 }
 
@@ -180,14 +189,19 @@ install_xray() {
 generate_credentials() {
   spinner_start "Generating UUID, x25519 keypair, and short ID"
 
-  UUID=$(xray uuid)
+  UUID=$(xray uuid 2>&1 || true)
+  [[ "$UUID" =~ ^[0-9a-fA-F-]{36}$ ]] || { spinner_stop 1 "UUID generation failed"; die "xray uuid returned unexpected output: $UUID"; }
 
   # xray x25519 output format: "Private key: xxx" / "Public key: xxx"
   # (older builds: "PrivateKey:" / "Password:") — handle both.
+  # NOTE: using awk alone (not grep | awk) for extraction — awk exits 0 even
+  # when its pattern doesn't match, whereas grep exits 1 on no match. Under
+  # `set -o pipefail`, a mid-pipe grep miss becomes the pipeline's reported
+  # exit status and silently kills the script via `set -e`. awk sidesteps that.
   local keys
-  keys=$(xray x25519)
-  PRIVATE_KEY=$(echo "$keys" | grep -iE "private ?key" | awk -F': ' '{print $2}' | tr -d '[:space:]')
-  PUBLIC_KEY=$(echo "$keys" | grep -iE "public ?key|password" | awk -F': ' '{print $2}' | tr -d '[:space:]')
+  keys=$(xray x25519 2>&1 || true)
+  PRIVATE_KEY=$(awk -F': ' 'tolower($0) ~ /private ?key/ {print $2}' <<<"$keys" | tr -d '[:space:]')
+  PUBLIC_KEY=$(awk -F': ' 'tolower($0) ~ /public ?key|password/ {print $2}' <<<"$keys" | tr -d '[:space:]')
 
   [[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" ]] || { spinner_stop 1 "Key generation failed"; die "Could not parse xray x25519 output:\n$keys"; }
 
@@ -328,8 +342,12 @@ enable_start_service() {
 # ────────────────────────────────────────────────────────────────────────────
 configure_firewall() {
   local ssh_port
-  ssh_port=$(ss -tlnp 2>/dev/null | grep -i sshd | grep -oE ':[0-9]+' | head -n1 | tr -d ':')
+  # awk-only extraction (see note in generate_credentials) — avoids grep
+  # returning non-zero on no match, which under pipefail+set -e would
+  # silently kill the script mid-firewall-setup.
+  ssh_port=$(ss -tlnp 2>/dev/null | awk '/sshd/ {n=split($4,a,":"); if (n>0) print a[n]; exit}')
   ssh_port="${ssh_port:-22}"
+  [[ "$ssh_port" =~ ^[0-9]+$ ]] || ssh_port=22
 
   if command -v ufw >/dev/null 2>&1; then
     spinner_start "Configuring ufw firewall (default-deny inbound)"
