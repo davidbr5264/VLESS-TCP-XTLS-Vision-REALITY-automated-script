@@ -331,7 +331,13 @@ install_xray() {
   fi
 
   spinner_start "Installing latest Xray-core (official script)"
-  if OUT=$(bash "$installer_tmp" @ install 2>&1); then
+  # NOTE: no "@" placeholder here. That placeholder is only needed with the
+  # `bash -c "$(curl ...)" @ install` idiom, where it fills $0 (since -c has
+  # no natural $0). Here we're executing a real file, so $0 is already the
+  # script path and the installer's first real argument must be "install"
+  # directly — passing "@" first would shove it into $1 instead and the
+  # installer's parser would reject it as an unrecognized option.
+  if OUT=$(bash "$installer_tmp" install 2>&1); then
     spinner_stop 0 "Xray-core installed"
   else
     spinner_stop 1 "Xray-core installation failed"
