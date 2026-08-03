@@ -11,6 +11,19 @@
 set -euo pipefail
 
 # ────────────────────────────────────────────────────────────────────────────
+#  Transcript logging (plain-text, ANSI-stripped) for post-install debugging
+# ────────────────────────────────────────────────────────────────────────────
+LOG_FILE="/var/log/xray-install.log"
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+: > "$LOG_FILE" 2>/dev/null || LOG_FILE="/dev/null"  # fall back quietly if unwritable (e.g. not root yet)
+
+log_to_file() {
+  local clean
+  clean=$(printf '%s' "$*" | sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' 2>/dev/null || printf '%s' "$*")
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$clean" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# ────────────────────────────────────────────────────────────────────────────
 #  Aesthetics: colours, symbols, spinner
 # ────────────────────────────────────────────────────────────────────────────
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'
@@ -30,13 +43,26 @@ EOF
   echo -e "${NC}"
 }
 
-log()   { echo -e "${ARROW} $*"; }
-ok()    { echo -e "${CHECK} $*"; }
-warn()  { echo -e "${YELLOW}⚠${NC}  $*"; }
-err()   { echo -e "${CROSS} $*" >&2; }
+log()   { echo -e "${ARROW} $*"; log_to_file "-> $*"; }
+ok()    { echo -e "${CHECK} $*"; log_to_file "OK   $*"; }
+warn()  { echo -e "${YELLOW}⚠${NC}  $*"; log_to_file "WARN $*"; }
+err()   { echo -e "${CROSS} $*" >&2; log_to_file "ERR  $*"; }
 die()   { err "$*"; exit 1; }
 
 SPINNER_PID=""
+cleanup_on_exit() {
+  local ec=$?
+  if [[ -n "$SPINNER_PID" ]]; then
+    kill "$SPINNER_PID" 2>/dev/null || true
+    wait "$SPINNER_PID" 2>/dev/null || true
+    SPINNER_PID=""
+    printf "\r\033[K"
+  fi
+  exit "$ec"
+}
+trap cleanup_on_exit EXIT
+trap 'die "Interrupted."' INT TERM
+
 spinner_start() {
   local msg="$1"
   local frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
@@ -66,11 +92,26 @@ run() {
   local out
   if out=$("$@" 2>&1); then
     spinner_stop 0 "$desc"
+    log_to_file "CMD  $* -> OK"
   else
     spinner_stop 1 "$desc"
     echo -e "${DIM}${out}${NC}"
+    log_to_file "CMD  $* -> FAILED. Output: ${out}"
     die "Command failed: $*"
   fi
+}
+
+retry() {
+  # retry <max_attempts> <command...>
+  local max="$1"; shift
+  local n=1 delay=2
+  until "$@"; do
+    if (( n >= max )); then
+      return 1
+    fi
+    sleep "$delay"
+    ((n++)); ((delay*=2))
+  done
 }
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -110,15 +151,80 @@ detect_arch() {
 }
 
 # ────────────────────────────────────────────────────────────────────────────
+#  Idempotency: detect an existing install and offer a lighter-weight path
+# ────────────────────────────────────────────────────────────────────────────
+detect_existing_install() {
+  EXISTING_INSTALL=0
+  if command -v xray >/dev/null 2>&1 && [[ -f /usr/local/etc/xray/config.json ]]; then
+    EXISTING_INSTALL=1
+  fi
+}
+
+offer_mode_selection() {
+  if [[ "$EXISTING_INSTALL" -ne 1 ]]; then
+    MODE="reprovision"
+    return 0
+  fi
+
+  warn "An existing Xray installation was found at /usr/local/etc/xray/config.json."
+
+  if [[ -n "${XRAY_MODE:-}" ]]; then
+    MODE="$XRAY_MODE"
+    log "Using mode from XRAY_MODE: ${MODE}"
+  elif [[ -t 0 ]]; then
+    echo
+    echo -e "  ${BOLD}1)${NC} Rotate credentials only — keep the existing SNI/port/firewall/systemd setup, generate a fresh UUID + x25519 keypair + short ID, restart Xray. Fast, minimal disruption."
+    echo -e "  ${BOLD}2)${NC} Full reprovision        — reinstall Xray-core, re-prompt for SNI/port, redo firewall + systemd hardening + BBR. Use after a distro upgrade or if something looks broken."
+    echo
+    read -rp "$(echo -e "${ARROW} Choose [1/2, default 1]: ")" mode_choice
+    case "${mode_choice:-1}" in
+      2) MODE="reprovision" ;;
+      *) MODE="rotate" ;;
+    esac
+  else
+    MODE="rotate"
+    warn "Non-interactive session — defaulting to credential rotation only. Set XRAY_MODE=reprovision to force a full reinstall."
+  fi
+}
+
+rotate_credentials_only() {
+  log "Rotating credentials — existing SNI, port, firewall, and systemd config are left untouched."
+
+  command -v jq >/dev/null 2>&1 || die "jq is required to read the existing config for rotation but isn't installed. Re-run with XRAY_MODE=reprovision."
+
+  SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // empty' /usr/local/etc/xray/config.json 2>/dev/null || true)
+  XPORT=$(jq -r '.inbounds[0].port // empty' /usr/local/etc/xray/config.json 2>/dev/null || true)
+  [[ -n "$SNI" && -n "$XPORT" ]] || die "Could not read SNI/port from the existing config.json (unexpected format) — re-run with XRAY_MODE=reprovision to rebuild it from scratch."
+
+  REMARK=""
+  if [[ -f /usr/local/etc/xray/client-info.json ]]; then
+    REMARK=$(jq -r '.link // empty' /usr/local/etc/xray/client-info.json 2>/dev/null | grep -oE '#[^&]*$' | tr -d '#' || true)
+  fi
+  REMARK="${REMARK:-VLESS-REALITY}"
+
+  generate_credentials
+  write_config
+  run "Restarting Xray with rotated credentials" systemctl restart xray
+  systemctl is-active --quiet xray || { journalctl -u xray -n 40 --no-pager; die "Xray failed to restart after rotation — see log above."; }
+  ok "Xray restarted with rotated credentials"
+}
+
+# ────────────────────────────────────────────────────────────────────────────
 #  Dependencies
 # ────────────────────────────────────────────────────────────────────────────
 install_deps() {
-  local pkgs=(curl wget unzip tar jq openssl qrencode)
+  local pkgs=(curl wget unzip tar jq openssl)
   if [[ "$PKG_MANAGER" == "apt" ]]; then
-    run "Updating package index"     apt-get update -y
-    run "Installing dependencies"    apt-get install -y "${pkgs[@]}" ufw cron
+    run "Updating package index"     retry 3 apt-get update -y
+    run "Installing dependencies"    apt-get install -y "${pkgs[@]}" ufw cron qrencode
   else
+    run "Refreshing package metadata" retry 3 "$PKG_MANAGER" makecache -y
+    # qrencode lives in EPEL on RHEL-family distros, not the base repos.
+    "$PKG_MANAGER" install -y epel-release >/dev/null 2>&1 || true
     run "Installing dependencies"    "$PKG_MANAGER" install -y "${pkgs[@]}" firewalld cronie
+    # QR display is a nice-to-have, not worth aborting the whole install over.
+    "$PKG_MANAGER" install -y qrencode >/dev/null 2>&1 \
+      || warn "qrencode unavailable (EPEL may not be enabled) — the client link will still be printed as text."
   fi
 }
 
@@ -131,27 +237,60 @@ DEFAULT_PORT="443"
 prompt_inputs() {
   echo
   echo -e "${BOLD}Configuration${NC}"
-  echo -e "${DIM}Press Enter to accept the default shown in [brackets].${NC}"
+  echo -e "${DIM}Press Enter to accept the default shown in [brackets]. Set XRAY_SNI / XRAY_PORT / XRAY_REMARK env vars to run non-interactively.${NC}"
   echo
 
-  read -rp "$(echo -e "${ARROW} SNI / camouflage domain [${DEFAULT_SNI}]: ")" SNI
-  SNI="${SNI:-$DEFAULT_SNI}"
+  if [[ -n "${XRAY_SNI:-}" ]]; then
+    SNI="$XRAY_SNI"
+    log "Using SNI from XRAY_SNI: ${SNI}"
+  else
+    read -rp "$(echo -e "${ARROW} SNI / camouflage domain [${DEFAULT_SNI}]: ")" SNI
+    SNI="${SNI:-$DEFAULT_SNI}"
+  fi
 
   # Basic sanity check on the SNI: must resolve and speak TLS1.3 on 443.
+  # `timeout` guards against s_client hanging forever on a filtered/unreachable host.
   spinner_start "Validating that ${SNI} supports TLS 1.3"
-  if echo | openssl s_client -connect "${SNI}:443" -tls1_3 -servername "${SNI}" 2>/dev/null | grep -q "TLSv1.3"; then
+  if echo | timeout 8 openssl s_client -connect "${SNI}:443" -tls1_3 -servername "${SNI}" 2>/dev/null | grep -q "TLSv1.3"; then
     spinner_stop 0 "${SNI} supports TLS 1.3 — good camouflage candidate"
   else
     spinner_stop 1 "Could not confirm TLS 1.3 support for ${SNI}"
     warn "Continuing anyway — REALITY may still work, but pick a well-known TLS1.3/H2 site if issues occur."
   fi
 
-  read -rp "$(echo -e "${ARROW} Xray listening port [${DEFAULT_PORT}]: ")" XPORT
-  XPORT="${XPORT:-$DEFAULT_PORT}"
+  if [[ -n "${XRAY_PORT:-}" ]]; then
+    XPORT="$XRAY_PORT"
+    log "Using port from XRAY_PORT: ${XPORT}"
+  else
+    read -rp "$(echo -e "${ARROW} Xray listening port [${DEFAULT_PORT}]: ")" XPORT
+    XPORT="${XPORT:-$DEFAULT_PORT}"
+  fi
   [[ "$XPORT" =~ ^[0-9]+$ && "$XPORT" -ge 1 && "$XPORT" -le 65535 ]] || die "Invalid port: $XPORT"
 
-  read -rp "$(echo -e "${ARROW} Client-visible remark/tag [VLESS-REALITY]: ")" REMARK
-  REMARK="${REMARK:-VLESS-REALITY}"
+  # Guard against locking yourself out of the box.
+  local current_ssh_port
+  current_ssh_port=$(ss -tlnp 2>/dev/null | awk '/sshd/ {n=split($4,a,":"); if (n>0) print a[n]; exit}')
+  current_ssh_port="${current_ssh_port:-22}"
+  if [[ "$XPORT" == "$current_ssh_port" ]]; then
+    die "Port ${XPORT} is also your active SSH port (${current_ssh_port}) — choose a different Xray port to avoid locking yourself out."
+  fi
+
+  # Warn early if something is already listening on the chosen port, rather
+  # than failing late inside systemd with a confusing journalctl dump.
+  if ss -tln 2>/dev/null | awk -v p=":${XPORT}\$" '$4 ~ p {found=1} END{exit !found}'; then
+    warn "Something is already listening on port ${XPORT}. Xray will fail to start unless that service is stopped first."
+  fi
+
+  if [[ -n "${XRAY_REMARK:-}" ]]; then
+    REMARK="$XRAY_REMARK"
+  else
+    read -rp "$(echo -e "${ARROW} Client-visible remark/tag [VLESS-REALITY]: ")" REMARK
+    REMARK="${REMARK:-VLESS-REALITY}"
+  fi
+  # Strip anything that isn't safe unescaped inside a URI fragment, so a
+  # stray & # % etc. in the remark can't corrupt the generated vless:// link.
+  REMARK=$(printf '%s' "$REMARK" | tr -c 'A-Za-z0-9 _.-' '_')
+  REMARK="${REMARK// /_}"
 
   echo
 }
@@ -160,14 +299,47 @@ prompt_inputs() {
 #  Xray-core install (official installer)
 # ────────────────────────────────────────────────────────────────────────────
 install_xray() {
-  spinner_start "Downloading & installing latest Xray-core (official script)"
-  if OUT=$(bash -c "$(curl -Ls https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)" @ install 2>&1); then
+  local installer_tmp
+  installer_tmp=$(mktemp)
+  # Ensure the temp file (and nothing else) is cleaned up even if the script
+  # exits before we get to remove it further down.
+  trap 'rm -f "$installer_tmp"; cleanup_on_exit' EXIT
+
+  # Two independent CDN paths to the same official script: if GitHub's raw
+  # host is down, rate-limited, or blocked by the VPS's network policy, the
+  # jsdelivr mirror serves the identical content from a different network.
+  # We deliberately still run the *official* upstream script rather than
+  # hand-rolling a manual binary/systemd install — that keeps us in lockstep
+  # with upstream's own install logic (geoip/geosite assets, service user,
+  # directory layout) instead of maintaining a second, divergence-prone copy.
+  local primary_url="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
+  local mirror_url="https://cdn.jsdelivr.net/gh/XTLS/Xray-install@main/install-release.sh"
+
+  spinner_start "Downloading Xray-install script"
+  if retry 3 curl -Ls -o "$installer_tmp" "$primary_url" && [[ -s "$installer_tmp" ]] && grep -q "Xray" "$installer_tmp"; then
+    spinner_stop 0 "Xray-install script downloaded"
+  else
+    spinner_stop 1 "Primary source unreachable — trying mirror"
+    warn "raw.githubusercontent.com unreachable or rate-limited — falling back to jsdelivr mirror"
+    spinner_start "Downloading Xray-install script (mirror)"
+    if retry 3 curl -Ls -o "$installer_tmp" "$mirror_url" && [[ -s "$installer_tmp" ]] && grep -q "Xray" "$installer_tmp"; then
+      spinner_stop 0 "Xray-install script downloaded (mirror)"
+    else
+      spinner_stop 1 "Download failed"
+      die "Could not download the official Xray-install script from GitHub or the jsdelivr mirror. Check network/DNS and retry."
+    fi
+  fi
+
+  spinner_start "Installing latest Xray-core (official script)"
+  if OUT=$(bash "$installer_tmp" @ install 2>&1); then
     spinner_stop 0 "Xray-core installed"
   else
     spinner_stop 1 "Xray-core installation failed"
     echo -e "${DIM}${OUT}${NC}"
     die "Aborting."
   fi
+  rm -f "$installer_tmp"
+  trap cleanup_on_exit EXIT
 
   command -v xray >/dev/null 2>&1 || die "xray binary not found after installation."
 
@@ -341,6 +513,11 @@ enable_start_service() {
 #  Firewall
 # ────────────────────────────────────────────────────────────────────────────
 configure_firewall() {
+  if [[ "${XRAY_SKIP_FW_RESET:-0}" == "1" ]]; then
+    warn "XRAY_SKIP_FW_RESET=1 — skipping firewall configuration. Make sure port ${XPORT} is reachable through whatever firewall you already have."
+    return 0
+  fi
+
   local ssh_port
   # awk-only extraction (see note in generate_credentials) — avoids grep
   # returning non-zero on no match, which under pipefail+set -e would
@@ -350,6 +527,18 @@ configure_firewall() {
   [[ "$ssh_port" =~ ^[0-9]+$ ]] || ssh_port=22
 
   if command -v ufw >/dev/null 2>&1; then
+    local existing_rules
+    existing_rules=$(ufw status numbered 2>/dev/null | grep -c '^\[' || true)
+    if [[ "${existing_rules:-0}" -gt 0 ]]; then
+      warn "ufw already has ${existing_rules} existing rule(s). This step RESETS ufw and replaces them with SSH + Xray-only rules."
+      if [[ -t 0 ]]; then
+        read -rp "$(echo -e "${ARROW} Continue and wipe the existing ufw rules? [y/N]: ")" confirm_reset
+        [[ "$confirm_reset" =~ ^[Yy]$ ]] || die "Aborted — existing firewall rules were left untouched. Re-run and confirm, set XRAY_SKIP_FW_RESET=1 to leave firewalling to you, or configure it manually."
+      else
+        warn "Non-interactive session — proceeding with the reset. Set XRAY_SKIP_FW_RESET=1 beforehand to skip firewall changes entirely instead."
+      fi
+    fi
+
     spinner_start "Configuring ufw firewall (default-deny inbound)"
     ufw --force reset >/dev/null 2>&1 || true
     ufw default deny incoming >/dev/null
@@ -375,6 +564,14 @@ configure_firewall() {
 # ────────────────────────────────────────────────────────────────────────────
 enable_bbr() {
   spinner_start "Enabling TCP BBR congestion control"
+
+  # Common on budget/OpenVZ-style VPS hosts: no tcp_bbr module and/or a
+  # kernel too old to support it. Detect that instead of claiming success.
+  if ! modprobe tcp_bbr 2>/dev/null && ! sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q bbr; then
+    spinner_stop 0 "BBR not available on this kernel/VPS host — skipped (not required for REALITY to work)"
+    return 0
+  fi
+
   if ! grep -q "net.core.default_qdisc" /etc/sysctl.conf 2>/dev/null; then
     {
       echo "net.core.default_qdisc=fq"
@@ -382,10 +579,11 @@ enable_bbr() {
     } >> /etc/sysctl.conf
   fi
   sysctl -p >/dev/null 2>&1 || true
+
   if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
     spinner_stop 0 "BBR enabled"
   else
-    spinner_stop 0 "BBR requested (kernel may need reboot to confirm)"
+    spinner_stop 0 "BBR requested but not confirmed active — some VPS kernels apply it only after reboot"
   fi
 }
 
@@ -398,6 +596,25 @@ enable_unattended_upgrades() {
     DEBIAN_FRONTEND=noninteractive apt-get install -y unattended-upgrades >/dev/null 2>&1 || true
     dpkg-reconfigure -f noninteractive unattended-upgrades >/dev/null 2>&1 || true
     spinner_stop 0 "Unattended security updates enabled"
+  elif [[ "$PKG_MANAGER" == "dnf" ]]; then
+    spinner_start "Enabling automatic security updates (dnf-automatic)"
+    "$PKG_MANAGER" install -y dnf-automatic >/dev/null 2>&1 || true
+    if [[ -f /etc/dnf/automatic.conf ]]; then
+      sed -i 's/^upgrade_type\s*=.*/upgrade_type = security/'  /etc/dnf/automatic.conf 2>/dev/null || true
+      sed -i 's/^apply_updates\s*=.*/apply_updates = yes/'     /etc/dnf/automatic.conf 2>/dev/null || true
+    fi
+    systemctl enable --now dnf-automatic.timer >/dev/null 2>&1 \
+      && spinner_stop 0 "Automatic security updates enabled (dnf-automatic)" \
+      || spinner_stop 0 "dnf-automatic unavailable — skipped (not fatal)"
+  else
+    spinner_start "Enabling automatic security updates (yum-cron)"
+    "$PKG_MANAGER" install -y yum-cron >/dev/null 2>&1 || true
+    if [[ -f /etc/yum/yum-cron.conf ]]; then
+      sed -i 's/^apply_updates\s*=.*/apply_updates = yes/' /etc/yum/yum-cron.conf 2>/dev/null || true
+    fi
+    systemctl enable --now yum-cron >/dev/null 2>&1 \
+      && spinner_stop 0 "Automatic security updates enabled (yum-cron)" \
+      || spinner_stop 0 "yum-cron unavailable — skipped (not fatal)"
   fi
 }
 
@@ -408,11 +625,15 @@ print_summary() {
   local server_ip
   server_ip=$(curl -s4 --max-time 5 https://api.ipify.org || curl -s6 --max-time 5 https://api64.ipify.org || echo "YOUR_SERVER_IP")
 
-  local link="vless://${UUID}@${server_ip}:${XPORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${REMARK// /_}"
+  local link="vless://${UUID}@${server_ip}:${XPORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${REMARK}"
 
   echo
   echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
-  echo -e "${GREEN}${BOLD} Installation complete${NC}"
+  if [[ "${MODE:-reprovision}" == "rotate" ]]; then
+    echo -e "${GREEN}${BOLD} Credentials rotated${NC}  ${DIM}(SNI, port, firewall, and systemd config unchanged)${NC}"
+  else
+    echo -e "${GREEN}${BOLD} Installation complete${NC}"
+  fi
   echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
   echo
   printf "  %-16s %s\n" "Server IP:"    "${server_ip}"
@@ -455,6 +676,7 @@ EOF
   echo -e "  ${DIM}Manage the service with: systemctl {status|restart|stop} xray${NC}"
   echo -e "  ${DIM}Config file:              /usr/local/etc/xray/config.json${NC}"
   echo -e "  ${DIM}Logs:                     journalctl -u xray -f${NC}"
+  echo -e "  ${DIM}Install transcript:       ${LOG_FILE}${NC}"
   echo
   echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
 }
@@ -467,16 +689,24 @@ main() {
   require_root
   detect_os
   detect_arch
-  install_deps
-  prompt_inputs
-  install_xray
-  generate_credentials
-  write_config
-  harden_systemd
-  enable_start_service
-  configure_firewall
-  enable_bbr
-  enable_unattended_upgrades
+  detect_existing_install
+  offer_mode_selection
+
+  if [[ "$MODE" == "rotate" ]]; then
+    rotate_credentials_only
+  else
+    install_deps
+    prompt_inputs
+    install_xray
+    generate_credentials
+    write_config
+    harden_systemd
+    enable_start_service
+    configure_firewall
+    enable_bbr
+    enable_unattended_upgrades
+  fi
+
   print_summary
 }
 
