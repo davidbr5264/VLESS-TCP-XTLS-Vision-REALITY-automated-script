@@ -41,148 +41,17 @@
 #
 set -euo pipefail
 
-SCRIPT_START_TIME=$(date +%s)
-
 # ---------------------------------------------------------------------------
-# Terminal output helpers (auto-disabled when not a real terminal, e.g.
-# piped to a log file, or when NO_COLOR is set -- so output stays clean
-# either way rather than dumping raw escape codes into a logfile).
+# Terminal output helpers (plain text, no color/animation)
 # ---------------------------------------------------------------------------
-if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]] && command -v tput >/dev/null 2>&1 && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
-  C_RESET=$(tput sgr0); C_BOLD=$(tput bold)
-  C_RED=$(tput setaf 1); C_GREEN=$(tput setaf 2); C_YELLOW=$(tput setaf 3)
-  C_BLUE=$(tput setaf 4); C_CYAN=$(tput setaf 6); C_MAGENTA=$(tput setaf 5)
-else
-  C_RESET=""; C_BOLD=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_CYAN=""; C_MAGENTA=""
-fi
-
-banner() {
-  echo ""
-  echo "${C_CYAN}${C_BOLD}  ╔══════════════════════════════════════════════════════╗${C_RESET}"
-  echo "${C_CYAN}${C_BOLD}  ║    Xray VLESS · TCP · XTLS-Vision · REALITY Setup    ║${C_RESET}"
-  echo "${C_CYAN}${C_BOLD}  ╚══════════════════════════════════════════════════════╝${C_RESET}"
-  echo ""
-}
-
-# Small icon per step, matched by keyword in the description -- purely
-# cosmetic, falls through to a generic bullet for anything unmatched.
-step_icon() {
-  case "$1" in
-    *"Preparing server"*)     echo "📦" ;;
-    *"Xray-core"*)            echo "⬇️ " ;;
-    *"credentials"*)          echo "🔑" ;;
-    *"Writing Xray config"*)  echo "⚙️ " ;;
-    *"systemd service"*)      echo "🛠️ " ;;
-    *"firewall"*)             echo "🛡️ " ;;
-    *"fail2ban"*)             echo "🚫" ;;
-    *"BBR"*)                  echo "⚡" ;;
-    *"reboot"*)               echo "🔄" ;;
-    *"Restarting"*)           echo "🔁" ;;
-    *"Rotating"*)             echo "🔃" ;;
-    *"Restoring"*)            echo "♻️ " ;;
-    *"backup"*|*"Scanning"*)  echo "🗂️ " ;;
-    *)                        echo "▪" ;;
-  esac
-}
-
-# Renders a filled/empty block progress bar for "n/total"-style labels.
-# Falls through to no bar for non-numeric labels (e.g. "final", "restore").
-# Builds the bar via string concatenation rather than `tr` -- `tr`
-# corrupts multi-byte UTF-8 characters when running in a non-UTF-8 locale
-# (confirmed: many minimal Debian/Ubuntu cloud images default to C/POSIX,
-# not UTF-8), so this avoids that failure mode entirely.
 step() {
-  local label="$1" desc="$2" icon
-  icon=$(step_icon "$desc")
   echo ""
-  echo "${C_BLUE}${C_BOLD}==> [$label]${C_RESET} ${icon} ${C_BOLD}${desc}${C_RESET}"
+  echo "=== [$1] $2 ==="
 }
 
-ok()   { echo "${C_GREEN}  ✓ $1${C_RESET}"; }
-warn() { echo "${C_YELLOW}  ⚠ WARNING:${C_RESET} $1" >&2; }
-err()  { echo "${C_RED}  ✗ ERROR:${C_RESET} $1" >&2; }
-
-# Human-readable elapsed time since SCRIPT_START_TIME (set at the very top
-# of the script), used in the final completion summary.
-elapsed_time() {
-  local now elapsed mins secs
-  now=$(date +%s)
-  elapsed=$((now - SCRIPT_START_TIME))
-  mins=$((elapsed / 60))
-  secs=$((elapsed % 60))
-  if [[ "$mins" -gt 0 ]]; then
-    echo "${mins}m ${secs}s"
-  else
-    echo "${secs}s"
-  fi
-}
-
-# Array, not a single multi-byte string indexed by offset -- confirmed
-# earlier in this project that byte/char-offset string slicing corrupts
-# multi-byte UTF-8 in a non-UTF-8 (C/POSIX) locale. Array elements are
-# always safe since each is treated as an opaque whole string.
-SPINNER_FRAMES=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
-SPINNER_COLORS=("$C_CYAN" "$C_BLUE" "$C_MAGENTA")
-
-# Runs a command in the background under an animated spinner, hiding its
-# normal (noisy) output. ALWAYS captures full output to a temp file and
-# ALWAYS prints it in full on failure -- nothing is ever silently
-# swallowed, only hidden when the command actually succeeds. Falls back
-# to a plain "running..." message with no animation when not a real
-# terminal (piped/logged output), but still hides-on-success there too.
-run_spinner() {
-  local desc="$1"; shift
-  local logfile
-  logfile=$(mktemp)
-
-  "$@" >"$logfile" 2>&1 &
-  local pid=$!
-
-  if [[ -t 1 ]]; then
-    tput civis 2>/dev/null || true
-    local i=0 frame color start_time now elapsed
-    start_time=$(date +%s)
-    while kill -0 "$pid" 2>/dev/null; do
-      frame="${SPINNER_FRAMES[i % ${#SPINNER_FRAMES[@]}]}"
-      color="${SPINNER_COLORS[i % ${#SPINNER_COLORS[@]}]}"
-      now=$(date +%s)
-      elapsed=$((now - start_time))
-      printf "\r${color}%s${C_RESET} %s... ${C_BOLD}(%ss)${C_RESET}" "$frame" "$desc" "$elapsed"
-      i=$((i + 1))
-      sleep 0.1
-    done
-    tput cnorm 2>/dev/null || true
-  else
-    echo "Running: ${desc}..."
-  fi
-
-  # Never let set -e trip on `wait` itself -- we need to reach our own
-  # success/failure handling below regardless of the wrapped command's
-  # exit code, not have the script abort mid-function.
-  local rc=0
-  wait "$pid" || rc=$?
-
-  if [[ -t 1 ]]; then
-    printf "\r\033[K"
-  fi
-
-  if [[ "$rc" -eq 0 ]]; then
-    ok "$desc"
-  else
-    err "${desc} failed (exit ${rc}). Full output:"
-    sed 's/^/  /' "$logfile" >&2
-  fi
-
-  rm -f "$logfile"
-  return "$rc"
-}
-
-# Restore the cursor if the script is interrupted mid-spinner (Ctrl+C etc)
-# -- otherwise a hidden cursor can persist in the terminal after exit.
-# Guarded by -t 1 so this never leaks a stray escape sequence into piped
-# or redirected output (e.g. --help | less) on runs that never actually
-# touched the spinner.
-trap '[[ -t 1 ]] && tput cnorm 2>/dev/null; true' EXIT
+ok()   { echo "  OK: $1"; }
+warn() { echo "  WARNING: $1" >&2; }
+err()  { echo "  ERROR: $1" >&2; }
 
 # ---------------------------------------------------------------------------
 # Configuration (edit if needed, or override via environment variables)
@@ -227,8 +96,6 @@ case "${1:-}" in
     exit 1
     ;;
 esac
-
-banner
 
 # ---------------------------------------------------------------------------
 # Preflight checks
@@ -655,21 +522,20 @@ Keep this file secret. It contains your private key.
 EOF
   chmod 600 "$CLIENT_INFO_FILE"
 
-  local status_now status_color
+  local status_now
   status_now=$(systemctl is-active ${SERVICE_NAME} 2>/dev/null || echo unknown)
-  if [[ "$status_now" == "active" ]]; then status_color="$C_GREEN"; else status_color="$C_YELLOW"; fi
 
   echo ""
-  echo "${C_CYAN}############################################################${C_RESET}"
-  echo "  Service status : ${status_color}${status_now}${C_RESET}"
+  echo "############################################################"
+  echo "  Service status : ${status_now}"
   echo "  Config file    : ${CONFIG_FILE}"
   echo "  Client info    : ${CLIENT_INFO_FILE} (chmod 600)"
-  echo "${C_CYAN}############################################################${C_RESET}"
+  echo "############################################################"
   echo ""
-  echo "${C_BOLD}Client link${C_RESET} (import into v2rayN / NekoBox / Shadowrocket / etc.):"
-  echo "${C_GREEN}${vless_link}${C_RESET}"
+  echo "Client link (import into v2rayN / NekoBox / Shadowrocket / etc.):"
+  echo "${vless_link}"
   echo ""
-  echo "${C_BOLD}QR code:${C_RESET}"
+  echo "QR code:"
   qrencode -t ansiutf8 "${vless_link}"
 }
 
@@ -887,7 +753,7 @@ fi
 if [[ -z "$UUID" ]] && [[ -t 0 ]]; then
   while true; do
     echo ""
-    echo "${C_BOLD}REALITY camouflage target (SNI)${C_RESET}"
+    echo "REALITY camouflage target (SNI)"
     echo "This is the real site Xray impersonates during the TLS handshake."
     echo "It should be a real TLS1.3 site, not a huge one (avoid google.com/"
     echo "microsoft.com-scale sites -- large certs can trip protocol issues,"
@@ -926,29 +792,29 @@ if [[ -z "$UUID" ]] && [[ -t 0 ]]; then
       break
     fi
   done
-  echo "Using: ${C_CYAN}${SNI_DOMAIN}${C_RESET}"
+  echo "Using: ${SNI_DOMAIN}"
 fi
 
 step "1/9" "Preparing server (updates, cleanup, essential tools)"
 export DEBIAN_FRONTEND=noninteractive
-run_spinner "Updating package lists" apt-get update -y
-run_spinner "Upgrading installed packages" apt-get upgrade -y
-run_spinner "Removing unused packages" apt-get autoremove -y --purge
-run_spinner "Cleaning apt cache" apt-get autoclean -y
+apt-get update -y
+apt-get upgrade -y
+apt-get autoremove -y --purge
+apt-get autoclean -y
 
 # Packages this script actually depends on -- install must succeed.
 # --no-install-recommends skips recommended-but-unused extras (docs,
 # fonts, etc.) that several of these commonly pull in by default on a
 # headless VPS that doesn't need them -- a real, if modest, bandwidth
 # and install-time saving on every run that needs to install anything here.
-run_spinner "Installing required packages" apt-get install -y --no-install-recommends \
+apt-get install -y --no-install-recommends \
   curl wget unzip jq openssl qrencode ufw fail2ban ca-certificates
 
 # "Nice to have" base tools some environments are missing by default.
 # Not required by anything below, so a missing package here (package
 # names/availability vary across Debian/Ubuntu versions and minimal
 # cloud images) should warn, not abort the whole install.
-if ! run_spinner "Installing optional packages" apt-get install -y --no-install-recommends gnupg lsb-release apt-transport-https logrotate; then
+if ! apt-get install -y --no-install-recommends gnupg lsb-release apt-transport-https logrotate; then
   echo "NOTE: one or more optional packages (gnupg/lsb-release/apt-transport-https/logrotate) were unavailable; continuing anyway, they aren't required."
 fi
 
@@ -996,15 +862,14 @@ if [[ "$SKIP_INSTALLER_CHECK" -eq 1 ]]; then
 else
   XRAY_INSTALL_ATTEMPTS=3
   for attempt in $(seq 1 "$XRAY_INSTALL_ATTEMPTS"); do
-    if run_spinner "Downloading and installing Xray-core (attempt ${attempt}/${XRAY_INSTALL_ATTEMPTS})" \
-         bash -c "$(curl -fsSL --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)" @ install; then
+    if bash -c "$(curl -fsSL --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)" @ install; then
       break
     fi
     if [[ "$attempt" -eq "$XRAY_INSTALL_ATTEMPTS" ]]; then
       err "Failed to install Xray-core after ${XRAY_INSTALL_ATTEMPTS} attempts (likely a network issue reaching GitHub)."
       exit 1
     fi
-    echo "Retrying in 5s..."
+    echo "Xray-core install attempt ${attempt} failed, retrying in 5s..."
     sleep 5
   done
   date +%s > "$XRAY_UPDATE_CHECK_CACHE"
@@ -1043,6 +908,7 @@ fi
 
 step "4/9" "Writing Xray config (privacy-minded: no access logging)"
 write_config
+ok "Config written and validated"
 
 step "5/9" "Hardening the systemd service"
 mkdir -p /etc/systemd/system/${SERVICE_NAME}.service.d
@@ -1348,15 +1214,15 @@ save_state
 output_client_info
 
 echo ""
-echo "${C_GREEN}${C_BOLD}✓ Setup complete.${C_RESET} Server will reboot daily at 00:00 (server local time)."
+echo "Setup complete. Server will reboot daily at 00:00 (server local time)."
 echo "Check timezone with: timedatectl   (change with: timedatectl set-timezone <Region/City>)"
 echo "Cancel the daily reboot with: systemctl disable --now daily-reboot.timer"
 echo ""
-echo "${C_BOLD}Re-run any time${C_RESET} (works via either name, from any directory):"
-echo "  ${C_CYAN}reality${C_RESET}                 -> re-apply full setup (backs up old config first)"
-echo "  ${C_CYAN}reality --rotate-uuid${C_RESET}   -> revoke current client link, keep server identity"
-echo "  ${C_CYAN}reality --rotate-all${C_RESET}    -> full credential reset (invalidates everything)"
-echo "  ${C_CYAN}reality --show${C_RESET}          -> reprint current client link + QR"
+echo "Re-run any time (works via either name, from any directory):"
+echo "  reality                 -> re-apply full setup (backs up old config first)"
+echo "  reality --rotate-uuid   -> revoke current client link, keep server identity"
+echo "  reality --rotate-all    -> full credential reset (invalidates everything)"
+echo "  reality --show          -> reprint current client link + QR"
 
 step "final" "Restarting Xray"
 SERVICE_CURRENTLY_ACTIVE=$(systemctl is-active --quiet "${SERVICE_NAME}" && echo 1 || echo 0)
@@ -1366,6 +1232,3 @@ if [[ "$CONFIG_CHANGED" == "0" ]] && [[ "$BEFORE_XRAY_VERSION" == "$AFTER_XRAY_V
 else
   restart_and_verify
 fi
-
-echo ""
-echo "${C_CYAN}Done in $(elapsed_time).${C_RESET}"
