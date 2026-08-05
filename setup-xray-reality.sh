@@ -732,6 +732,12 @@ SELF_UPDATE_RESULT_FILE=$(mktemp)
 SELF_UPDATE_BG_PID=""
 if [[ -f "$SELF_UPDATE_CHECK_PATH" ]]; then
   (
+    # Close the inherited lock fd immediately -- otherwise, if the parent
+    # script exits early (e.g. apt-get update fails under set -e) before
+    # this background job finishes, this orphaned subshell keeps its own
+    # copy of the flock held for as long as it keeps running, blocking a
+    # re-run unnecessarily in the meantime.
+    exec 200>&- 2>/dev/null || true
     REMOTE_SCRIPT_TMP=$(mktemp)
     if curl -fsSL --connect-timeout 5 --max-time 10 "$SCRIPT_SOURCE_URL" -o "$REMOTE_SCRIPT_TMP" 2>/dev/null \
        && bash -n "$REMOTE_SCRIPT_TMP" 2>/dev/null; then
@@ -807,15 +813,18 @@ apt-get autoclean -y
 # fonts, etc.) that several of these commonly pull in by default on a
 # headless VPS that doesn't need them -- a real, if modest, bandwidth
 # and install-time saving on every run that needs to install anything here.
+# (unzip isn't referenced by name below, but is a real dependency of the
+# official Xray installer script itself, which unzips the downloaded
+# release -- confirmed by reading that installer's source directly.)
 apt-get install -y --no-install-recommends \
-  curl wget unzip jq openssl qrencode ufw fail2ban ca-certificates
+  curl unzip jq openssl qrencode ufw fail2ban ca-certificates
 
-# "Nice to have" base tools some environments are missing by default.
-# Not required by anything below, so a missing package here (package
-# names/availability vary across Debian/Ubuntu versions and minimal
-# cloud images) should warn, not abort the whole install.
-if ! apt-get install -y --no-install-recommends gnupg lsb-release apt-transport-https logrotate; then
-  echo "NOTE: one or more optional packages (gnupg/lsb-release/apt-transport-https/logrotate) were unavailable; continuing anyway, they aren't required."
+# logrotate is the only "nice to have" actually used (by the
+# /etc/logrotate.d/xray config written in step 8). Not required by
+# anything else, so a missing package here should warn, not abort.
+if ! apt-get install -y --no-install-recommends logrotate; then
+  echo "NOTE: logrotate was unavailable; continuing anyway. Xray's error log just won't"
+  echo "      be rotated automatically until it's installed."
 fi
 
 if [[ -f /var/run/reboot-required ]]; then
