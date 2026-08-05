@@ -114,6 +114,21 @@ retry() {
   done
 }
 
+urlencode() {
+  # Percent-encode anything outside the URI-safe unreserved set. Used for
+  # embedding generated values (e.g. VLESS Encryption strings) into the
+  # vless:// link's query string without corrupting it.
+  local s="$1" out="" c i hex
+  for (( i=0; i<${#s}; i++ )); do
+    c="${s:i:1}"
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      *) printf -v hex '%%%02X' "'$c"; out+="$hex" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 # ────────────────────────────────────────────────────────────────────────────
 #  Pre-flight checks
 # ────────────────────────────────────────────────────────────────────────────
@@ -202,7 +217,22 @@ rotate_credentials_only() {
   fi
   REMARK="${REMARK:-VLESS-REALITY}"
 
+  # Preserve whatever VLESS Encryption state the box already had, unless the
+  # caller explicitly overrides it via XRAY_VLESS_ENCRYPTION for this run.
+  if [[ -n "${XRAY_VLESS_ENCRYPTION:-}" ]]; then
+    ENABLE_VLESS_ENC="$XRAY_VLESS_ENCRYPTION"
+  else
+    local existing_dec
+    existing_dec=$(jq -r '.inbounds[0].settings.decryption // "none"' /usr/local/etc/xray/config.json 2>/dev/null || echo "none")
+    if [[ "$existing_dec" == mlkem768x25519plus.* ]]; then
+      ENABLE_VLESS_ENC=1
+    else
+      ENABLE_VLESS_ENC=0
+    fi
+  fi
+
   generate_credentials
+  generate_vless_encryption
   write_config
   run "Restarting Xray with rotated credentials" systemctl restart xray
   systemctl is-active --quiet xray || { journalctl -u xray -n 40 --no-pager; die "Xray failed to restart after rotation — see log above."; }
@@ -226,6 +256,91 @@ install_deps() {
     "$PKG_MANAGER" install -y qrencode >/dev/null 2>&1 \
       || warn "qrencode unavailable (EPEL may not be enabled) — the client link will still be printed as text."
   fi
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+#  Full system package upgrade (security priority: close any pending CVEs
+#  on a fresh/neglected VPS image before exposing a proxy service on it)
+# ────────────────────────────────────────────────────────────────────────────
+upgrade_system_packages() {
+  local out
+  if [[ "${XRAY_SKIP_UPGRADE:-0}" == "1" ]]; then
+    warn "XRAY_SKIP_UPGRADE=1 — skipping full package upgrade. Pending security patches, if any, are left unapplied."
+    return 0
+  fi
+
+  if [[ "$PKG_MANAGER" == "apt" ]]; then
+    spinner_start "Upgrading installed packages (security patches)"
+    # `upgrade` (not `dist-upgrade`) — applies available updates without
+    # removing/replacing packages, which is the safer choice to run
+    # unattended on someone else's box. noninteractive + needrestart in
+    # automatic mode so a pending kernel/lib update can't pop a TUI prompt
+    # and hang the installer waiting for keyboard input that will never come.
+    if out=$(DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+              retry 2 apt-get upgrade -y 2>&1); then
+      spinner_stop 0 "Installed packages upgraded"
+      log_to_file "apt-get upgrade output: ${out}"
+    else
+      spinner_stop 1 "Package upgrade failed — continuing anyway"
+      warn "Some packages failed to upgrade; this isn't fatal, but review ${LOG_FILE} and consider upgrading manually later."
+      log_to_file "apt-get upgrade FAILED. Output: ${out}"
+    fi
+  else
+    spinner_start "Upgrading installed packages (security patches)"
+    if out=$(retry 2 "$PKG_MANAGER" upgrade -y 2>&1); then
+      spinner_stop 0 "Installed packages upgraded"
+      log_to_file "${PKG_MANAGER} upgrade output: ${out}"
+    else
+      spinner_stop 1 "Package upgrade failed — continuing anyway"
+      warn "Some packages failed to upgrade; this isn't fatal, but review ${LOG_FILE} and consider upgrading manually later."
+      log_to_file "${PKG_MANAGER} upgrade FAILED. Output: ${out}"
+    fi
+  fi
+
+  # A kernel package may have just been updated; it won't take effect until
+  # reboot. The nightly reboot step (if enabled) will pick this up on its
+  # own — surfaced here just so the summary output is accurate either way.
+  if [[ -f /var/run/reboot-required ]]; then
+    REBOOT_PENDING=1
+  fi
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+#  Nightly reboot (clears leaked memory, applies any pending kernel update)
+# ────────────────────────────────────────────────────────────────────────────
+schedule_nightly_reboot() {
+  if [[ "${XRAY_SKIP_REBOOT:-0}" == "1" ]]; then
+    warn "XRAY_SKIP_REBOOT=1 — skipping the nightly reboot schedule."
+    return 0
+  fi
+
+  spinner_start "Scheduling automatic reboot at midnight"
+
+  # Cron's own PATH is minimal and often lacks /sbin or /usr/sbin, so resolve
+  # the absolute path now rather than relying on `shutdown` being found later
+  # inside cron's restricted environment.
+  local shutdown_bin
+  shutdown_bin=$(command -v shutdown 2>/dev/null || echo "/usr/sbin/shutdown")
+  if [[ ! -x "$shutdown_bin" ]]; then
+    spinner_stop 1 "Could not locate the shutdown binary"
+    warn "Skipping nightly reboot — 'shutdown' not found at ${shutdown_bin}. Set it up manually if desired."
+    return 0
+  fi
+
+  # Make sure cron itself is actually running — installed doesn't imply enabled.
+  if [[ "$PKG_MANAGER" == "apt" ]]; then
+    systemctl enable --now cron >/dev/null 2>&1 || true
+  else
+    systemctl enable --now crond >/dev/null 2>&1 || true
+  fi
+
+  local marker="xray-reality-auto-reboot"
+  local cron_line="0 0 * * * ${shutdown_bin} -r now # ${marker}"
+  # Idempotent: strip any previous line we added, then re-add exactly one.
+  ( crontab -l 2>/dev/null | grep -v "$marker"; echo "$cron_line" ) | crontab -
+
+  spinner_stop 0 "Reboot scheduled for 00:00 server time (crontab, marker: ${marker})"
+  log "Xray is set to start on boot, so this reboot won't interrupt service beyond the brief downtime of restarting itself."
 }
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -291,6 +406,18 @@ prompt_inputs() {
   # stray & # % etc. in the remark can't corrupt the generated vless:// link.
   REMARK=$(printf '%s' "$REMARK" | tr -c 'A-Za-z0-9 _.-' '_')
   REMARK="${REMARK// /_}"
+
+  if [[ -n "${XRAY_VLESS_ENCRYPTION:-}" ]]; then
+    ENABLE_VLESS_ENC="$XRAY_VLESS_ENCRYPTION"
+    log "Using VLESS Encryption setting from XRAY_VLESS_ENCRYPTION: ${ENABLE_VLESS_ENC}"
+  else
+    echo
+    echo -e "  ${BOLD}Experimental: post-quantum VLESS Encryption${NC}"
+    echo -e "  ${DIM}Adds an ML-KEM-768 post-quantum layer on top of REALITY (xray vlessenc).${NC}"
+    echo -e "  ${DIM}Very new — only the latest client apps support it. If unsure, choose No.${NC}"
+    read -rp "$(echo -e "${ARROW} Enable it? [y/N]: ")" vless_enc_choice
+    [[ "$vless_enc_choice" =~ ^[Yy]$ ]] && ENABLE_VLESS_ENC=1 || ENABLE_VLESS_ENC=0
+  fi
 
   echo
 }
@@ -389,6 +516,46 @@ generate_credentials() {
 }
 
 # ────────────────────────────────────────────────────────────────────────────
+#  Optional: post-quantum VLESS Encryption (ML-KEM-768), on top of REALITY
+# ────────────────────────────────────────────────────────────────────────────
+generate_vless_encryption() {
+  # Always define these so write_config/print_summary have a safe default,
+  # whether or not this feature is requested or supported.
+  DECRYPTION="none"
+  CLIENT_ENCRYPTION="none"
+
+  [[ "${ENABLE_VLESS_ENC:-0}" == "1" ]] || return 0
+
+  spinner_start "Generating post-quantum VLESS Encryption keys (ML-KEM-768)"
+
+  local vout
+  if ! vout=$(xray vlessenc 2>&1); then
+    spinner_stop 1 "vlessenc not available on this Xray-core build"
+    warn "Falling back to standard VLESS (decryption=\"none\") — still fully secure, just not post-quantum. Update Xray-core for vlessenc support."
+    return 0
+  fi
+
+  # `xray vlessenc` prints both an X25519 (classical) and an ML-KEM-768
+  # (post-quantum) option. We specifically want the post-quantum block, so
+  # isolate the text starting at its header before extracting fields —
+  # otherwise we could silently pick up the weaker classical-only keys.
+  local pq_block dec enc
+  pq_block=$(awk '/ML-KEM-768/{flag=1} flag' <<<"$vout")
+  dec=$(awk -F'"' '/"decryption"/{print $4; exit}' <<<"$pq_block")
+  enc=$(awk -F'"' '/"encryption"/{print $4; exit}' <<<"$pq_block")
+
+  if [[ -n "$dec" && -n "$enc" && "$dec" == mlkem768x25519plus.* ]]; then
+    DECRYPTION="$dec"
+    CLIENT_ENCRYPTION="$enc"
+    spinner_stop 0 "Post-quantum VLESS Encryption keys generated"
+  else
+    spinner_stop 1 "Could not parse vlessenc output — falling back to standard VLESS"
+    warn "vlessenc output format didn't match what this script expects; continuing with decryption=\"none\" (still fully secure, just not post-quantum). See ${LOG_FILE} for the raw output."
+    log_to_file "vlessenc raw output: ${vout}"
+  fi
+}
+
+# ────────────────────────────────────────────────────────────────────────────
 #  Server config
 # ────────────────────────────────────────────────────────────────────────────
 write_config() {
@@ -419,7 +586,7 @@ write_config() {
             "email": "user1@${SNI}"
           }
         ],
-        "decryption": "none"
+        "decryption": "${DECRYPTION}"
       },
       "streamSettings": {
         "network": "tcp",
@@ -453,6 +620,12 @@ write_config() {
       "tag": "block"
     }
   ],
+  "dns": {
+    "servers": [
+      "https://1.1.1.1/dns-query",
+      "https://8.8.8.8/dns-query"
+    ]
+  },
   "routing": {
     "domainStrategy": "IPIfNonMatch",
     "rules": [
@@ -631,7 +804,9 @@ print_summary() {
   local server_ip
   server_ip=$(curl -s4 --max-time 5 https://api.ipify.org || curl -s6 --max-time 5 https://api64.ipify.org || echo "YOUR_SERVER_IP")
 
-  local link="vless://${UUID}@${server_ip}:${XPORT}?encryption=none&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${REMARK}"
+  local enc_param
+  enc_param=$(urlencode "${CLIENT_ENCRYPTION:-none}")
+  local link="vless://${UUID}@${server_ip}:${XPORT}?encryption=${enc_param}&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${REMARK}"
 
   echo
   echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
@@ -651,6 +826,11 @@ print_summary() {
   printf "  %-16s %s\n" "Short ID:"     "${SHORT_ID}"
   printf "  %-16s %s\n" "Fingerprint:"  "chrome"
   printf "  %-16s %s\n" "Network:"      "tcp"
+  if [[ "${CLIENT_ENCRYPTION:-none}" != "none" ]]; then
+    printf "  %-16s %s\n" "VLESS Enc:"   "post-quantum (ML-KEM-768) — client must support VLESS Encryption"
+  else
+    printf "  %-16s %s\n" "VLESS Enc:"   "none (standard — works with virtually all clients)"
+  fi
   echo
   echo -e "  ${BOLD}Client import link:${NC}"
   echo -e "  ${CYAN}${link}${NC}"
@@ -673,6 +853,7 @@ print_summary() {
   "publicKey": "${PUBLIC_KEY}",
   "shortId": "${SHORT_ID}",
   "fingerprint": "chrome",
+  "vlessEncryption": "${CLIENT_ENCRYPTION:-none}",
   "link": "${link}"
 }
 EOF
@@ -683,6 +864,12 @@ EOF
   echo -e "  ${DIM}Config file:              /usr/local/etc/xray/config.json${NC}"
   echo -e "  ${DIM}Logs:                     journalctl -u xray -f${NC}"
   echo -e "  ${DIM}Install transcript:       ${LOG_FILE}${NC}"
+  if [[ "${XRAY_SKIP_REBOOT:-0}" != "1" ]]; then
+    echo -e "  ${DIM}Nightly reboot:           00:00 server time (crontab -l to view, XRAY_SKIP_REBOOT=1 to disable next run)${NC}"
+  fi
+  if [[ "${REBOOT_PENDING:-0}" == "1" ]]; then
+    warn "A kernel/library update was installed and needs a reboot to take effect — tonight's scheduled reboot will apply it automatically."
+  fi
   echo
   echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════════════${NC}"
 }
@@ -700,17 +887,21 @@ main() {
 
   if [[ "$MODE" == "rotate" ]]; then
     rotate_credentials_only
+    schedule_nightly_reboot
   else
     install_deps
+    upgrade_system_packages
     prompt_inputs
     install_xray
     generate_credentials
+    generate_vless_encryption
     write_config
     harden_systemd
     enable_start_service
     configure_firewall
     enable_bbr
     enable_unattended_upgrades
+    schedule_nightly_reboot
   fi
 
   print_summary
