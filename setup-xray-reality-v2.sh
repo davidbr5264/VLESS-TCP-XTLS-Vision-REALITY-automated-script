@@ -27,7 +27,7 @@ log_to_file() {
 #  Aesthetics: colours, symbols, spinner
 # ────────────────────────────────────────────────────────────────────────────
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'
-BLUE=$'\033[0;34m'; CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; DIM=$'\033[2m'; NC=$'\033[0m'
+CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; DIM=$'\033[2m'; NC=$'\033[0m'
 CHECK="${GREEN}✔${NC}"; CROSS="${RED}✘${NC}"; ARROW="${CYAN}➜${NC}"
 
 banner() {
@@ -50,22 +50,40 @@ err()   { echo -e "${CROSS} $*" >&2; log_to_file "ERR  $*"; }
 die()   { err "$*"; exit 1; }
 
 SPINNER_PID=""
-cleanup_on_exit() {
-  local ec=$?
+_kill_spinner() {
   if [[ -n "$SPINNER_PID" ]]; then
     kill "$SPINNER_PID" 2>/dev/null || true
     wait "$SPINNER_PID" 2>/dev/null || true
     SPINNER_PID=""
-    printf "\r\033[K"
   fi
+}
+
+TMP_FILES=()
+cleanup_on_exit() {
+  local ec=$? f
+  _kill_spinner
+  printf "\r\033[K"
+  for f in "${TMP_FILES[@]:-}"; do
+    [[ -n "$f" ]] && rm -f "$f"
+  done
   exit "$ec"
 }
 trap cleanup_on_exit EXIT
 trap 'die "Interrupted."' INT TERM
 
+have() { command -v "$1" >/dev/null 2>&1; }
+
 spinner_start() {
   local msg="$1"
+  # Bash indexes strings by byte, not character, under a non-UTF-8 locale
+  # (still common on minimal/base VPS images pinned to C/POSIX). Indexing
+  # into multi-byte braille characters byte-by-byte there would print
+  # garbled partial sequences instead of a spinner, so fall back to plain
+  # ASCII frames unless the locale is confirmed UTF-8-aware.
   local frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+  if [[ "$(locale charmap 2>/dev/null)" != "UTF-8" ]]; then
+    frames='|/-\'
+  fi
   ( while true; do
       for ((i=0; i<${#frames}; i++)); do
         printf "\r${CYAN}%s${NC} %s " "${frames:$i:1}" "$msg"
@@ -77,11 +95,7 @@ spinner_start() {
 }
 spinner_stop() {
   local status="${1:-0}" msg="${2:-}"
-  if [[ -n "$SPINNER_PID" ]]; then
-    kill "$SPINNER_PID" 2>/dev/null || true
-    wait "$SPINNER_PID" 2>/dev/null || true
-    SPINNER_PID=""
-  fi
+  _kill_spinner
   printf "\r\033[K"
   if [[ "$status" -eq 0 ]]; then ok "$msg"; else err "$msg"; fi
 }
@@ -129,6 +143,16 @@ urlencode() {
   printf '%s' "$out"
 }
 
+detect_ssh_port() {
+  # awk-only extraction (not grep | awk) — awk exits 0 even on no match,
+  # whereas grep exits 1, which under set -o pipefail would silently kill
+  # the script via set -e if used mid-pipe in an assignment.
+  local port
+  port=$(ss -tlnp 2>/dev/null | awk '/sshd/ {n=split($4,a,":"); if (n>0) print a[n]; exit}')
+  [[ "$port" =~ ^[0-9]+$ ]] || port=22
+  printf '%s' "$port"
+}
+
 # ────────────────────────────────────────────────────────────────────────────
 #  Pre-flight checks
 # ────────────────────────────────────────────────────────────────────────────
@@ -150,27 +174,19 @@ detect_os() {
     PKG_MANAGER="apt"
   elif [[ "$OS_ID" =~ ^(centos|rhel|rocky|almalinux|fedora)$ ]] || [[ "$OS_LIKE" =~ (rhel|fedora) ]]; then
     PKG_MANAGER="dnf"
-    command -v dnf >/dev/null 2>&1 || PKG_MANAGER="yum"
+    have dnf || PKG_MANAGER="yum"
   else
     die "Unsupported distro: $OS_ID. This script supports Debian/Ubuntu and RHEL-family only."
   fi
 }
 
-detect_arch() {
-  case "$(uname -m)" in
-    x86_64|amd64)   ARCH="64" ;;
-    aarch64|arm64)  ARCH="arm64-v8a" ;;
-    armv7l)         ARCH="arm32-v7a" ;;
-    *) die "Unsupported architecture: $(uname -m)" ;;
-  esac
-}
 
 # ────────────────────────────────────────────────────────────────────────────
 #  Idempotency: detect an existing install and offer a lighter-weight path
 # ────────────────────────────────────────────────────────────────────────────
 detect_existing_install() {
   EXISTING_INSTALL=0
-  if command -v xray >/dev/null 2>&1 && [[ -f /usr/local/etc/xray/config.json ]]; then
+  if have xray && [[ -f /usr/local/etc/xray/config.json ]]; then
     EXISTING_INSTALL=1
   fi
 }
@@ -205,7 +221,7 @@ offer_mode_selection() {
 rotate_credentials_only() {
   log "Rotating credentials — existing SNI, port, firewall, and systemd config are left untouched."
 
-  command -v jq >/dev/null 2>&1 || die "jq is required to read the existing config for rotation but isn't installed. Re-run with XRAY_MODE=reprovision."
+  have jq || die "jq is required to read the existing config for rotation but isn't installed. Re-run with XRAY_MODE=reprovision."
 
   SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // empty' /usr/local/etc/xray/config.json 2>/dev/null || true)
   XPORT=$(jq -r '.inbounds[0].port // empty' /usr/local/etc/xray/config.json 2>/dev/null || true)
@@ -243,7 +259,7 @@ rotate_credentials_only() {
 #  Dependencies
 # ────────────────────────────────────────────────────────────────────────────
 install_deps() {
-  local pkgs=(curl wget unzip tar jq openssl)
+  local pkgs=(curl unzip jq openssl ca-certificates)
   if [[ "$PKG_MANAGER" == "apt" ]]; then
     run "Updating package index"     retry 3 apt-get update -y
     run "Installing dependencies"    apt-get install -y "${pkgs[@]}" ufw cron qrencode
@@ -384,8 +400,7 @@ prompt_inputs() {
 
   # Guard against locking yourself out of the box.
   local current_ssh_port
-  current_ssh_port=$(ss -tlnp 2>/dev/null | awk '/sshd/ {n=split($4,a,":"); if (n>0) print a[n]; exit}')
-  current_ssh_port="${current_ssh_port:-22}"
+  current_ssh_port=$(detect_ssh_port)
   if [[ "$XPORT" == "$current_ssh_port" ]]; then
     die "Port ${XPORT} is also your active SSH port (${current_ssh_port}) — choose a different Xray port to avoid locking yourself out."
   fi
@@ -428,9 +443,7 @@ prompt_inputs() {
 install_xray() {
   local installer_tmp
   installer_tmp=$(mktemp)
-  # Ensure the temp file (and nothing else) is cleaned up even if the script
-  # exits before we get to remove it further down.
-  trap 'rm -f "$installer_tmp"; cleanup_on_exit' EXIT
+  TMP_FILES+=("$installer_tmp")  # cleanup_on_exit removes it however the script exits
 
   # Two independent CDN paths to the same official script: if GitHub's raw
   # host is down, rate-limited, or blocked by the VPS's network policy, the
@@ -464,17 +477,16 @@ install_xray() {
   # script path and the installer's first real argument must be "install"
   # directly — passing "@" first would shove it into $1 instead and the
   # installer's parser would reject it as an unrecognized option.
-  if OUT=$(bash "$installer_tmp" install 2>&1); then
+  local out
+  if out=$(bash "$installer_tmp" install 2>&1); then
     spinner_stop 0 "Xray-core installed"
   else
     spinner_stop 1 "Xray-core installation failed"
-    echo -e "${DIM}${OUT}${NC}"
+    echo -e "${DIM}${out}${NC}"
     die "Aborting."
   fi
-  rm -f "$installer_tmp"
-  trap cleanup_on_exit EXIT
 
-  command -v xray >/dev/null 2>&1 || die "xray binary not found after installation."
+  have xray || die "xray binary not found after installation."
 
   # NOTE: deliberately not piping through `head` here. Under `set -o pipefail`,
   # `xray version | head -n1` can make xray receive SIGPIPE when head closes
@@ -482,7 +494,7 @@ install_xray() {
   # even though everything "worked" — and that silently kills the whole
   # script under `set -e` with no error message. Capture full output first,
   # then take the first line with a pure bash string operation instead.
-  local ver_full
+  local ver_full XRAY_VERSION
   ver_full=$(xray version 2>&1 || true)
   XRAY_VERSION="${ver_full%%$'\n'*}"
   ok "Installed: ${XRAY_VERSION}"
@@ -562,10 +574,10 @@ write_config() {
   spinner_start "Writing hardened Xray server configuration"
 
   mkdir -p /usr/local/etc/xray
-  BACKUP_DIR="/usr/local/etc/xray/backup"
+  local backup_dir="/usr/local/etc/xray/backup"
   if [[ -f /usr/local/etc/xray/config.json ]]; then
-    mkdir -p "$BACKUP_DIR"
-    cp /usr/local/etc/xray/config.json "${BACKUP_DIR}/config.json.$(date +%s).bak"
+    mkdir -p "$backup_dir"
+    cp /usr/local/etc/xray/config.json "${backup_dir}/config.json.$(date +%s).bak"
   fi
 
   cat > /usr/local/etc/xray/config.json <<EOF
@@ -645,9 +657,12 @@ write_config() {
 EOF
 
   # Validate the config with xray itself before touching the running service.
-  if ! xray run -test -config /usr/local/etc/xray/config.json >/tmp/xray-test.log 2>&1; then
+  local test_log
+  test_log=$(mktemp)
+  TMP_FILES+=("$test_log")
+  if ! xray run -test -config /usr/local/etc/xray/config.json >"$test_log" 2>&1; then
     spinner_stop 1 "Config validation failed"
-    cat /tmp/xray-test.log
+    cat "$test_log"
     die "Generated config.json is invalid — aborting before starting the service."
   fi
 
@@ -698,14 +713,9 @@ configure_firewall() {
   fi
 
   local ssh_port
-  # awk-only extraction (see note in generate_credentials) — avoids grep
-  # returning non-zero on no match, which under pipefail+set -e would
-  # silently kill the script mid-firewall-setup.
-  ssh_port=$(ss -tlnp 2>/dev/null | awk '/sshd/ {n=split($4,a,":"); if (n>0) print a[n]; exit}')
-  ssh_port="${ssh_port:-22}"
-  [[ "$ssh_port" =~ ^[0-9]+$ ]] || ssh_port=22
+  ssh_port=$(detect_ssh_port)
 
-  if command -v ufw >/dev/null 2>&1; then
+  if have ufw; then
     local existing_rules
     existing_rules=$(ufw status numbered 2>/dev/null | grep -c '^\[' || true)
     if [[ "${existing_rules:-0}" -gt 0 ]]; then
@@ -726,7 +736,7 @@ configure_firewall() {
     ufw allow "${XPORT}/tcp" comment "Xray REALITY" >/dev/null
     ufw --force enable >/dev/null
     spinner_stop 0 "ufw enabled — only SSH(${ssh_port}) and ${XPORT}/tcp are open"
-  elif command -v firewall-cmd >/dev/null 2>&1; then
+  elif have firewall-cmd; then
     spinner_start "Configuring firewalld"
     systemctl enable --now firewalld >/dev/null 2>&1
     firewall-cmd --permanent --add-port="${ssh_port}/tcp" >/dev/null
@@ -836,7 +846,7 @@ print_summary() {
   echo -e "  ${CYAN}${link}${NC}"
   echo
 
-  if command -v qrencode >/dev/null 2>&1; then
+  if have qrencode; then
     echo -e "  ${BOLD}Scan to import (v2rayNG / Shadowrocket / NekoBox / etc.):${NC}"
     qrencode -t ANSIUTF8 "${link}"
     echo
@@ -881,7 +891,6 @@ main() {
   banner
   require_root
   detect_os
-  detect_arch
   detect_existing_install
   offer_mode_selection
 
