@@ -58,6 +58,10 @@ err()  { echo "  ERROR: $1" >&2; }
 # ---------------------------------------------------------------------------
 SNI_DOMAIN_DEFAULT="${SNI_DOMAIN:-i.ytimg.com}"   # REALITY camouflage target
 LISTEN_PORT_DEFAULT="${LISTEN_PORT:-443}"         # Xray listen port
+if ! [[ "$LISTEN_PORT_DEFAULT" =~ ^[0-9]+$ ]] || [[ "$LISTEN_PORT_DEFAULT" -lt 1 ]] || [[ "$LISTEN_PORT_DEFAULT" -gt 65535 ]]; then
+  err "LISTEN_PORT must be a number between 1 and 65535 (got: '${LISTEN_PORT_DEFAULT}')."
+  exit 1
+fi
 # Used as a fallback to install the 'reality' shortcut when this script is
 # run via a process substitution / pipe (e.g. `bash <(curl -Ls ...)`),
 # where $0 doesn't point to an actual file on disk. Override via env var
@@ -540,6 +544,20 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# Helper: shared by every mode that ends with save+print+restart, so this
+# sequence only has to be correct in one place instead of being hand-rolled
+# identically across rotate-uuid/rotate-all (install mode's version differs
+# slightly -- it can skip the restart entirely on a genuine no-op run, via
+# the CONFIG_CHANGED/version-compare check -- so it stays separate, inline,
+# near the end of the script).
+# ---------------------------------------------------------------------------
+finish_and_restart() {
+  save_state
+  output_client_info
+  restart_and_verify
+}
+
+# ---------------------------------------------------------------------------
 # MODE: --show  (read-only, no changes)
 # ---------------------------------------------------------------------------
 if [[ "$MODE" == "show" ]]; then
@@ -676,9 +694,7 @@ if [[ "$MODE" == "rotate-uuid" ]]; then
   backup_current_state
   generate_uuid_and_shortid
   write_config
-  save_state
-  output_client_info
-  restart_and_verify
+  finish_and_restart
   echo ""
   echo "Old client link is now invalid. Any device using it must import the new link above."
   exit 0
@@ -691,7 +707,7 @@ if [[ "$MODE" == "rotate-all" ]]; then
   if [[ -t 0 ]]; then
     echo ""
     warn "This invalidates EVERY existing client link. Not undoable except by --restore."
-    read -r -p "Type 'yes' to continue: " CONFIRM_ROTATE_ALL
+    read -r -t 300 -p "Type 'yes' to continue: " CONFIRM_ROTATE_ALL || true
     if [[ "$CONFIRM_ROTATE_ALL" != "yes" ]]; then
       echo "Cancelled. No changes made."
       exit 0
@@ -702,9 +718,7 @@ if [[ "$MODE" == "rotate-all" ]]; then
   generate_uuid_and_shortid
   generate_reality_keypair
   write_config
-  save_state
-  output_client_info
-  restart_and_verify
+  finish_and_restart
   echo ""
   echo "All previous client links are now permanently invalid."
   exit 0
@@ -764,7 +778,7 @@ if [[ -z "$UUID" ]] && [[ -t 0 ]]; then
     echo "It should be a real TLS1.3 site, not a huge one (avoid google.com/"
     echo "microsoft.com-scale sites -- large certs can trip protocol issues,"
     echo "and CDN-fronted domains make REALITY easier to fingerprint)."
-    read -r -p "Domain to use [${SNI_DOMAIN}]: " SNI_INPUT
+    read -r -t 300 -p "Domain to use [${SNI_DOMAIN}]: " SNI_INPUT || true
     if [[ -n "$SNI_INPUT" ]]; then
       # Basic sanitization in case someone pastes a full URL by mistake:
       # strip scheme, path, port, and trailing slashes -- keep just the host.
@@ -788,7 +802,7 @@ if [[ -z "$UUID" ]] && [[ -t 0 ]]; then
       else
         warn "Couldn't confirm ${SNI_DOMAIN} serves TLS1.3 on port 443 (DNS failure, no"
         echo "         response, or TLS1.3 unsupported). REALITY requires this to work." >&2
-        read -r -p "Use it anyway? (y/N): " SNI_FORCE
+        read -r -t 300 -p "Use it anyway? (y/N): " SNI_FORCE || true
         if [[ "$SNI_FORCE" =~ ^[Yy]$ ]]; then
           break
         fi
@@ -803,10 +817,14 @@ fi
 
 step "1/9" "Preparing server (updates, cleanup, essential tools)"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get upgrade -y
-apt-get autoremove -y --purge
-apt-get autoclean -y
+# -o DPkg::Lock::Timeout=300: fresh VPS instances commonly have
+# unattended-upgrades holding the dpkg lock for the first few minutes
+# after boot. Without this, apt-get fails immediately instead of waiting
+# for it to finish -- wait up to 5 minutes rather than failing outright.
+apt-get -o DPkg::Lock::Timeout=300 update -y
+apt-get -o DPkg::Lock::Timeout=300 upgrade -y
+apt-get -o DPkg::Lock::Timeout=300 autoremove -y --purge
+apt-get -o DPkg::Lock::Timeout=300 autoclean -y
 
 # Packages this script actually depends on -- install must succeed.
 # --no-install-recommends skips recommended-but-unused extras (docs,
@@ -816,13 +834,13 @@ apt-get autoclean -y
 # (unzip isn't referenced by name below, but is a real dependency of the
 # official Xray installer script itself, which unzips the downloaded
 # release -- confirmed by reading that installer's source directly.)
-apt-get install -y --no-install-recommends \
+apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends \
   curl unzip jq openssl qrencode ufw fail2ban ca-certificates
 
 # logrotate is the only "nice to have" actually used (by the
 # /etc/logrotate.d/xray config written in step 8). Not required by
 # anything else, so a missing package here should warn, not abort.
-if ! apt-get install -y --no-install-recommends logrotate; then
+if ! apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends logrotate; then
   echo "NOTE: logrotate was unavailable; continuing anyway. Xray's error log just won't"
   echo "      be rotated automatically until it's installed."
 fi
